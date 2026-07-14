@@ -1,0 +1,54 @@
+# Local toolchains and editor state
+.tools/
+.agents/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*.tmp
+*.log
+
+# Source material used during reverse engineering; not part of the product repo
+/样例项目/
+/设备相关资料/
+
+# Arduino / PlatformIO / native build output
+**/.pio/
+**/.venv/
+**/.build/
+**/build/
+**/bin/
+**/obj/
+*.elf
+*.map
+*.d
+*.o
+
+# Firmware artifacts are reproducible; publish reviewed binaries via Releases, not Git history
+/firmware/epaper75-bringup/dist/
+/firmware/epaper75-app/dist/*
+!/firmware/epaper75-app/dist/README.md
+
+# Device-specific full-flash backups can contain Wi-Fi credentials and NVS data
+/firmware/epaper75-bringup/backups/
+**/factory-original-*-8mb.bin
+**/*full-flash*.bin
+**/*flash-dump*.bin
+**/serial*.txt
+
+# Local credentials and machine-specific settings
+.env
+.env.*
+!.env.example
+**/secrets.h
+**/credentials.h
+**/auth.json
+**/.credentials.json
+**/settings.local.json
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
