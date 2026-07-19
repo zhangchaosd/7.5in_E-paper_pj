@@ -1,7 +1,7 @@
-# Epaper75 0.4 application
+# Epaper75 0.5 application
 
 This is the product firmware for the recovered ESP32 e-paper device. The
-current development version is `0.4.0-p1`. It is intentionally separate from
+current flashed version is `0.5.0-p1`. It is intentionally separate from
 `epaper75-bringup`, which remains the P0 hardware diagnostic and rollback
 reference.
 
@@ -27,7 +27,7 @@ reference.
 - Serves a privacy-bounded, read-only API on port 80: `/api/info` and
   `/api/health`. There are no HTTP write routes or network endpoints for Agent
   credentials.
-- Renders a full-refresh, dual-column Home page: shared Codex account Weekly
+- Renders a dual-column Home page: shared Codex account Weekly
   data on the left and three independent Agent activity rows on the right.
 - Agent slot 0 is the fixed preferred account source. Because all three
   installations share one account, another identity-verified Agent may provide
@@ -48,7 +48,13 @@ reference.
   no longer provide network-latency data.
 - Keeps temperature and humidity on the System page only. Normal display
   changes are rate-limited to protect the panel.
-- Runs the HTTP API and Agent client on Core 0, so a roughly 21-second e-paper
+- Uses one merged partial window for ordinary visible changes. First boot,
+  page changes, explicit cleanup, dirty windows covering at least 72% of the
+  screen, and residue maintenance after 24 partial updates or 6 hours use a
+  full refresh. The Z08 panel has no fast-partial waveform; a partial window
+  still takes roughly the same waveform time but avoids flashing the rest of
+  the screen.
+- Runs the HTTP API and Agent client on Core 0, so a long physical e-paper
   refresh does not make discovery endpoints or Agent polling disappear.
 
 The screen deliberately contains no button legend. In the final right-edge
@@ -125,4 +131,4 @@ source, Git, shell history, terminal logs, screenshots or test output. The
 firmware deliberately has no `/api/agents` or Wi-Fi provisioning field for
 these secrets. The retired Bridge workflow is documented only as a historical
 migration pointer in `../../docs/BRIDGE_PROTOCOL.md` and is not required by
-`0.4.x`.
+`0.5.x`.

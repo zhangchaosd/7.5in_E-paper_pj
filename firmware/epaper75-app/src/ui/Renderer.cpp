@@ -475,7 +475,7 @@ void Renderer::drawSystemPage(Adafruit_GFX& canvas,
   text(canvas, right, 140, 2, kBlack, "MCU       ESP32-WROOM-32E");
   text(canvas, right, 167, 2, kBlack, "PANEL     800x480 B/W/RED");
   text(canvas, right, 194, 2, kBlack, "FLASH     8 MB / NO PSRAM");
-  text(canvas, right, 221, 1, kBlack, "DISPLAY   FULL / EVENT DRIVEN");
+  text(canvas, right, 221, 1, kBlack, "DISPLAY   PARTIAL + FULL CLEAN");
 
   text(canvas, right, 254, 2, kBlack, "SENSORS & BATTERY");
   canvas.drawFastHLine(right, 277, 366, kBlack);

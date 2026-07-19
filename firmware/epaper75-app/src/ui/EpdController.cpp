@@ -72,7 +72,8 @@ class SafePanelDriver : public GxEPD2_750c_Z08 {
                   int16_t y, int16_t w, int16_t h, bool invert = false,
                   bool mirrorY = false, bool pgm = false) {
     if (operationFailed_) return;
-    if (x != 0 || w != static_cast<int16_t>(WIDTH) || y < 0 || h <= 0 ||
+    if (x < 0 || y < 0 || w <= 0 || h <= 0 || (x % 8) != 0 ||
+        (w % 8) != 0 || x + w > static_cast<int16_t>(WIDTH) ||
         y + h > static_cast<int16_t>(HEIGHT) || black == nullptr ||
         color == nullptr) {
       fail(FailureStage::Geometry);
@@ -117,21 +118,30 @@ class SafePanelDriver : public GxEPD2_750c_Z08 {
 
   void refresh(bool partialUpdateMode = false) override {
     if (operationFailed_) return;
-    if (partialUpdateMode || !initializeDisplay() || !powerOn()) {
-      if (partialUpdateMode) fail(FailureStage::Geometry);
+    if (partialUpdateMode) {
+      refresh(0, 0, WIDTH, HEIGHT);
       return;
     }
+    if (!initializeDisplay() || !powerOn()) return;
     _writeCommand(0x12);
     waitReady(board::kEpdStageTimeoutMs, FailureStage::Refresh);
   }
 
   void refresh(int16_t x, int16_t y, int16_t w, int16_t h) override {
-    if (x == 0 && y == 0 && w == static_cast<int16_t>(WIDTH) &&
-        h == static_cast<int16_t>(HEIGHT)) {
-      refresh(false);
-    } else {
+    if (operationFailed_) return;
+    if (x < 0 || y < 0 || w <= 0 || h <= 0 || (x % 8) != 0 ||
+        (w % 8) != 0 || x + w > static_cast<int16_t>(WIDTH) ||
+        y + h > static_cast<int16_t>(HEIGHT)) {
       fail(FailureStage::Geometry);
+      return;
     }
+    if (!initializeDisplay() || !powerOn()) return;
+    setPartialRamArea(static_cast<uint16_t>(x), static_cast<uint16_t>(y),
+                      static_cast<uint16_t>(w), static_cast<uint16_t>(h));
+    _writeCommand(0x12);
+    if (!waitReady(board::kEpdStageTimeoutMs, FailureStage::Refresh)) return;
+    _writeCommand(0x92);  // partial out
+    delay(1);
   }
 
   void powerOff() override {
@@ -273,6 +283,11 @@ class SafePanelDriver : public GxEPD2_750c_Z08 {
 
 using PanelDisplay = GxEPD2_3C<SafePanelDriver, board::kEpdPageHeight>;
 
+static_assert(GxEPD2_750c_Z08::hasPartialUpdate,
+              "The selected panel driver must support partial windows");
+static_assert(!GxEPD2_750c_Z08::hasFastPartialUpdate,
+              "Do not select the unsupported fast-partial wrapper path");
+
 PanelDisplay gDisplay(SafePanelDriver(board::kEpdCs, board::kEpdDc,
                                      board::kEpdReset, board::kEpdBusy));
 
@@ -346,7 +361,8 @@ EpdController::EpdController() : journalState_(readJournal()) {
   if (faultLocked_) lastError_ = EpdError::PersistedFault;
 }
 
-bool EpdController::refresh(const app::UiModel& model) {
+bool EpdController::refresh(const app::UiModel& model,
+                            const app::RefreshPlan& plan) {
   if (refreshInProgress_) {
     lastError_ = EpdError::ReentrantRefresh;
     return false;
@@ -365,6 +381,7 @@ bool EpdController::refresh(const app::UiModel& model) {
 
   refreshInProgress_ = true;
   lastError_ = EpdError::None;
+  lastRefreshKind_ = app::RefreshKind::None;
   lastRefreshDurationMs_ = 0;
 
   pinMode(board::kEpdBusy, INPUT);
@@ -387,7 +404,7 @@ bool EpdController::refresh(const app::UiModel& model) {
       delay(50);
     }
 
-    if (performRefresh(model, recoveryAttempt)) {
+    if (performRefresh(model, plan, recoveryAttempt)) {
       refreshInProgress_ = false;
       lastError_ = EpdError::None;
       return true;
@@ -418,14 +435,38 @@ bool EpdController::prepareInterruptedRefresh(
 }
 
 bool EpdController::performRefresh(const app::UiModel& model,
+                                   const app::RefreshPlan& plan,
                                    bool recoveryAttempt) {
+  if (plan.kind == app::RefreshKind::None) {
+    lastError_ = EpdError::DriverOperationFailed;
+    return false;
+  }
   if (!initializePanel(recoveryAttempt)) return false;
+
+  const app::RefreshWindow& requested = plan.window;
+  const bool validPartialWindow =
+      requested.valid() && (requested.x % 8U) == 0U &&
+      (requested.width % 8U) == 0U &&
+      requested.x + requested.width <= board::kEpdWidth &&
+      requested.y + requested.height <= board::kEpdHeight;
+  // A reboot has no trustworthy in-RAM baseline. A failed partial attempt also
+  // retries as full because the physical window may be in an uncertain state.
+  const bool usePartial = plan.kind == app::RefreshKind::Partial &&
+                          validPartialWindow && panelBaselineValid_ &&
+                          !recoveryAttempt;
+  const app::RefreshKind actualKind =
+      usePartial ? app::RefreshKind::Partial : app::RefreshKind::Full;
 
   setJournal(PanelJournalState::Refreshing);
   const uint32_t startedAtMs = millis();
 
   gDisplay.setRotation(0);
-  gDisplay.setFullWindow();
+  if (usePartial) {
+    gDisplay.setPartialWindow(requested.x, requested.y, requested.width,
+                              requested.height);
+  } else {
+    gDisplay.setFullWindow();
+  }
   gDisplay.firstPage();
   bool hasMorePages = false;
   do {
@@ -449,8 +490,9 @@ bool EpdController::performRefresh(const app::UiModel& model,
     return false;
   }
 
-  // GxEPD2's full paged nextPage() already powers off.  Calling powerOff()
-  // again is an idempotent guard and never places the controller in hibernate.
+  // The full paged path already powers off, while the partial path does not.
+  // This call is therefore required for partial and idempotent for full; it
+  // never places the controller in hibernate.
   gDisplay.powerOff();
   if (!waitUntilReady(board::kEpdPostResetReadyMs)) {
     lastError_ = EpdError::BusyAfterRefresh;
@@ -458,8 +500,11 @@ bool EpdController::performRefresh(const app::UiModel& model,
   }
 
   setJournal(PanelJournalState::PoweredOff);
+  panelBaselineValid_ = true;
+  lastRefreshKind_ = actualKind;
   releaseBusHigh();
-  Serial.printf("EPD: full refresh complete in %lu ms; panel powered off\n",
+  Serial.printf("EPD: %s refresh complete in %lu ms; panel powered off\n",
+                app::refreshKindName(actualKind),
                 static_cast<unsigned long>(lastRefreshDurationMs_));
   return true;
 }
@@ -565,6 +610,7 @@ void EpdController::lockFault(EpdError error) {
   shutdownAfterFailure();
   setJournal(PanelJournalState::Fault);
   faultLocked_ = true;
+  panelBaselineValid_ = false;
   Serial.printf("EPD: FAULT LOCKED for this retained boot (%s)\n",
                 epdErrorName(lastError_));
 }

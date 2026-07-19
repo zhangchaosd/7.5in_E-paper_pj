@@ -84,6 +84,9 @@ void printInfo() {
                 static_cast<unsigned long>(model.revision),
                 ui::panelJournalStateName(epd.journalState()),
                  ui::epdErrorName(epd.lastError()));
+  Serial.printf("display_refresh=%s partial_since_full=%u\n",
+                app::refreshKindName(epd.lastRefreshKind()),
+                refreshPolicy.partialRefreshesSinceFull());
   if (model.telemetry.batteryPercent >= 0) {
     Serial.printf("battery=%u mV (~%d%%)\n",
                   model.telemetry.batteryMillivolts,
@@ -97,7 +100,7 @@ void printHelp() {
   Serial.println("  SENSOR                sample SHT30 and battery now");
   Serial.println("  POLL                  request an immediate Agent poll");
   Serial.println("  AGENTS ...            write private Agent settings over USB");
-  Serial.println("  REFRESH               request a rate-limited full refresh");
+  Serial.println("  REFRESH               request a rate-limited full cleanup");
   Serial.println("  PAGE 0|1              dashboard or system page");
   Serial.println("  MODE auto|claude|codex");
   Serial.println("  HELP");
@@ -296,7 +299,7 @@ void ensureDeviceServer(uint32_t nowMs) {
 }
 
 void serviceDisplay(uint32_t nowMs) {
-  if (runtimeState.consumeRefreshRequest()) refreshPolicy.force(nowMs);
+  if (runtimeState.consumeRefreshRequest()) refreshPolicy.forceFull(nowMs);
 
   const app::UiModel observed = runtimeState.snapshot();
   refreshPolicy.observe(observed, nowMs);
@@ -308,13 +311,17 @@ void serviceDisplay(uint32_t nowMs) {
     return;
   }
 
-  Serial.printf("[display] refresh revision %lu page %u starting\n",
-                static_cast<unsigned long>(observed.revision), observed.page);
-  const bool ok = epd.refresh(observed);
+  const app::RefreshPlan plan = refreshPolicy.plan();
+  Serial.printf(
+      "[display] %s revision %lu page %u window=%u,%u %ux%u starting\n",
+      app::refreshKindName(plan.kind),
+      static_cast<unsigned long>(observed.revision), observed.page,
+      plan.window.x, plan.window.y, plan.window.width, plan.window.height);
+  const bool ok = epd.refresh(observed, plan);
   const uint32_t finishedAtMs = millis();
   if (ok) {
     runtimeState.markDisplayed(finishedAtMs);
-    refreshPolicy.markCompleted(observed.revision, finishedAtMs);
+    refreshPolicy.markCompleted(observed, epd.lastRefreshKind(), finishedAtMs);
     Serial.printf("[display] completed in %lu ms\n",
                   static_cast<unsigned long>(finishedAtMs - nowMs));
   } else {
@@ -323,7 +330,7 @@ void serviceDisplay(uint32_t nowMs) {
                   ui::panelJournalStateName(epd.journalState()));
     if (epd.isFaultLocked()) {
       // A fault-locked panel must never be placed in an automatic retry loop.
-      refreshPolicy.markCompleted(observed.revision, finishedAtMs);
+      refreshPolicy.markAbandoned(finishedAtMs);
     }
   }
 }

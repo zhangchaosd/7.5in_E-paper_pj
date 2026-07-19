@@ -1,4 +1,4 @@
-# Epaper75 0.4 architecture and feasibility
+# Epaper75 0.5 architecture and feasibility
 
 ## System boundary
 
@@ -12,8 +12,8 @@ flowchart LR
     U["Local USB serial\nAGENTS command"]
     S["RuntimeState\nbounded display data only"]
     H["Device HTTP API\nsafe aggregates, core 0"]
-    P["RefreshPolicy\n30/60 s floors"]
-    E["EpdController\nsafe full-refresh state machine"]
+    P["RefreshPolicy\ndirty-window merge + 30/60 s floors"]
+    E["EpdController\nbounded full / partial state machine"]
     D["7.5-inch 800x480\nblack / white / red"]
     X["SHT30 + battery + buttons\nGPIO25 gated, core 1"]
 
@@ -54,8 +54,8 @@ valid.
 
 `DeviceServer` runs on Core 0 at priority 2. `AgentClient` is a low-priority
 Core 0 task. Button scanning and the display state machine run from the Arduino
-main loop on Core 1. An approximately 21-second physical refresh can pause
-button scanning, but it does not directly block the Core 0 HTTP or Agent tasks.
+main loop on Core 1. A long full or partial physical waveform can pause button
+scanning, but it does not directly block the Core 0 HTTP or Agent tasks.
 
 HTTP handlers expose read-only aggregates and never call the display. Agent
 endpoints, the shared Bearer token and the learned, NVS-pinned installation
@@ -64,7 +64,7 @@ display-safe labels, task text, counts, enum states and timestamps enter
 `RuntimeState`.
 
 The legacy four-site DNS + TCP/443 `NetworkProbe` source remains available for
-historical diagnostics but is not started by `0.4.0-p1`. No probe task writes
+historical diagnostics but is not started by `0.5.0-p1`. No probe task writes
 `RuntimeState`, no latency is rendered or returned by the device API, and
 latency jitter cannot trigger a physical refresh.
 
@@ -119,22 +119,27 @@ Temperature, humidity, approximate battery percentage/voltage, firmware and
 connectivity details remain on System. Home has no IP/subtitle row, button
 legend or bottom help copy.
 
-## Display lifecycle
+## Display lifecycle and refresh planning
 
-The upstream GxEPD2 Z08 driver uses a `void` BUSY wait that merely logs a
-timeout. The product firmware therefore supplies a minimal, project-specific
-full-screen path:
+The pinned GxEPD2 Z08 driver identifies the panel as partial-window capable but
+sets `hasFastPartialUpdate=false`; both its full and partial timing constants
+are 18 seconds. The firmware therefore uses partial windows to limit visible
+flashing, not to claim an unsupported fast waveform. The upstream driver also
+uses a `void` BUSY wait that merely logs a timeout, so the product firmware
+supplies a project-specific bounded path:
 
 ```text
 Unknown / PoweredOff
         -> bounded recovery wait when prior state is uncertain
         -> hardware reset + init
-        -> page writes (0x91/0x90, black 0x10, red 0x13, 0x92)
-        -> full refresh 0x12 with a bounded BUSY wait
+        -> full-screen or byte-aligned partial page writes
+           (0x91/0x90, black 0x10, red 0x13, 0x92)
+        -> exactly one refresh 0x12 with a bounded BUSY wait
         -> bounded power-off 0x02
         -> PoweredOff
 
-Any failure -> at most one reset/recovery attempt -> FaultLocked
+Partial failure -> one reset/recovery attempt promoted to full refresh
+Any second failure -> FaultLocked
 ```
 
 The RTC journal uses a magic value and checksum in `RTC_NOINIT_ATTR`. It can
@@ -143,9 +148,20 @@ brownout, or full power loss may erase it; those cases become `Unknown` and use
 the conservative BUSY wait plus reset path. It is deliberately not written to
 NVS on every refresh, avoiding unnecessary flash wear.
 
-Only event-driven full refresh is enabled. Ordinary semantic changes wait at
-least 60 seconds; attention transitions and explicit requests still observe a
-30-second hard floor. Partial refresh is not enabled.
+`RefreshPolicy` compares the desired model with the last successfully displayed
+model. It maps visible changes to fixed byte-aligned regions (header status,
+account column, fleet summary, each device row, and the two System columns),
+then merges all regions into one bounding window. One scheduling cycle can
+therefore issue at most one panel waveform; it never performs several
+back-to-back partial updates.
+
+The plan is promoted to full screen when there is no trusted in-boot baseline,
+the page changes, an explicit cleanup is requested, the merged dirty window is
+at least 72% of the screen, 24 partial updates have accumulated, or the last
+full cleanup is at least six hours old. Ordinary semantic changes still wait at
+least 60 seconds; attention transitions and explicit requests observe the
+existing 30-second hard floor. A full or partial success always ends with a
+bounded power-off and released SPI pins.
 
 ## Device API
 
@@ -180,7 +196,7 @@ refresh remain local to USB serial or the physical buttons.
 
 | Area | Verdict | Remaining proof |
 |---|---|---|
-| ESP32 firmware and panel | Feasible, high confidence | Re-run full refresh and refresh-interrupt tests for `0.4.0-p1` |
+| ESP32 firmware and panel | Feasible, high confidence | Continue long-run partial-residue observation and refresh-interrupt tests for `0.5.0-p1` |
 | Three authenticated Agents | Feasible, implemented | Verify all reachable LAN routes, schema/identity locks, and one-Agent-offline degradation |
 | Shared Weekly account quota | Feasible, implemented | Confirm primary-first and fallback behavior with live CMA data |
 | Fleet UI | Feasible within e-paper constraints | Physical 800x480 visual acceptance and long-task truncation check |
@@ -189,6 +205,7 @@ refresh remain local to USB serial or the physical buttons.
 | Battery productization | Not yet proven | Current draw, low-voltage cutoff, sleep and runtime tests |
 
 The project remains technically viable. The dominant constraints are slow
-full refresh, no PSRAM, plain-HTTP Agent transport on a trusted LAN, one
+full and partial waveforms, no hardware fast-partial mode, no PSRAM,
+plain-HTTP Agent transport on a trusted LAN, one
 potentially unroutable Agent network, uncalibrated battery measurement, and
 unmeasured panel high-voltage behavior under a forced BUSY fault.

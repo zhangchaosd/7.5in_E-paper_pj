@@ -55,8 +55,10 @@ macOS/Linux 必须使用：
 3. Wi-Fi/NVS 配置仍保留；
 4. `/api/health` 的 Wi-Fi/Agent 安全聚合状态正常，且没有泄露 endpoint、token 或安装 ID；
 5. 三个按键映射不变；
-6. 只做一次必要的物理全刷，确认约 21 秒内完成；
-7. 最终再次确认 `panel=powered_off` 和无显示错误。
+6. 做一次必要的物理全刷；若版本改动局刷，再做一次局部窗口刷新并确认
+   没有窗口外异常擦写；
+7. 确认每次刷新后只执行一次更新波形，最终再次确认
+   `panel=powered_off` 和无显示错误。
 
 不要在公开日志中粘贴完整 `INFO`、原始 HTTP 响应或串口 `AGENTS` 配置命令；它们可能
 包含网络地址、Agent 端点、Bearer token、安装 ID 或串口标识。只报告经过
