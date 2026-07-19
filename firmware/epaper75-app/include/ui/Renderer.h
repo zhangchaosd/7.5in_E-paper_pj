@@ -17,12 +17,11 @@ class Renderer {
                      const app::UiModel& model) const;
   void drawDashboard(Adafruit_GFX& canvas,
                      const app::UiModel& model) const;
-  void drawCodexUsage(Adafruit_GFX& canvas,
-                      const app::UiModel& model) const;
-  void drawLatencyRow(Adafruit_GFX& canvas,
-                      const app::LatencyTargetSnapshot& target,
-                      size_t targetIndex, int16_t x, int16_t y,
-                      int16_t width) const;
+  void drawAccountQuota(Adafruit_GFX& canvas,
+                        const app::UiModel& model) const;
+  void drawDeviceRow(Adafruit_GFX& canvas,
+                     const app::UiModel& model, size_t deviceIndex,
+                     int16_t y) const;
   void drawSystemPage(Adafruit_GFX& canvas,
                       const app::UiModel& model) const;
   void drawProgress(Adafruit_GFX& canvas, int16_t x, int16_t y,

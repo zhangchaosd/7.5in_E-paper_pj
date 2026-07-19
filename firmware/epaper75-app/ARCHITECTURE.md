@@ -1,22 +1,28 @@
-# Epaper75 P1 architecture and feasibility
+# Epaper75 0.4 architecture and feasibility
 
 ## System boundary
 
 ```mermaid
 flowchart LR
-    B["Desktop Bridge\nGET /status :8765"]
-    C["BridgeClient\n5 s polling, core 1"]
-    N["NetworkProbe\n4 x DNS + TCP/443, low-priority core 0"]
-    S["RuntimeState\nfixed-size POD + portMUX"]
-    H["Device HTTP API\nport 80, core 0"]
+    A1["Codex Monitor Agent 0\nschema 1.1"]
+    A2["Codex Monitor Agent 1\nschema 1.1"]
+    A3["Codex Monitor Agent 2\nschema 1.1"]
+    C["AgentClient\nBearer auth, staggered polling\nlow-priority core 0"]
+    K["SettingsStore\nprivate endpoints/token in NVS"]
+    U["Local USB serial\nAGENTS command"]
+    S["RuntimeState\nbounded display data only"]
+    H["Device HTTP API\nsafe aggregates, core 0"]
     P["RefreshPolicy\n30/60 s floors"]
     E["EpdController\nsafe full-refresh state machine"]
     D["7.5-inch 800x480\nblack / white / red"]
     X["SHT30 + battery + buttons\nGPIO25 gated, core 1"]
 
-    B -->|"JSON"| C
+    A1 -->|"HTTP + Bearer"| C
+    A2 -->|"HTTP + Bearer"| C
+    A3 -->|"HTTP + Bearer"| C
+    K --> C
+    U -->|"private configuration"| K
     C --> S
-    N --> S
     X --> S
     H <--> S
     S --> P
@@ -24,55 +30,100 @@ flowchart LR
     E --> D
 ```
 
-The desktop Bridge is the data source and the ESP32 is the display and device
-API. The Bridge's existing status collection and `GET /status` JSON remain
-unchanged. TFT, GIF, RGB565 animation, backlight, music, and high-frequency
-network charts from the sample device are intentionally outside P1.
+The three desktop Agents are the data sources. The ESP32 is a read-only fleet
+dashboard and a small device API; it does not read Codex files or credentials
+from a desktop directly and it does not approve or answer tasks.
 
-## Firmware layers
+All three Agent installations use one Codex account. Account quota is therefore
+one shared snapshot, while workload, thread and action state remain separate
+per installation. Slot 0 is the fixed preferred account source; another
+identity-verified Agent can provide fallback quota data.
+
+The retired `0.3.x` desktop Bridge and its `GET /status` payload are outside the
+current system. `docs/BRIDGE_PROTOCOL.md` exists only to keep historical links
+valid.
+
+## Firmware layers and tasks
 
 | Layer | Responsibility |
 |---|---|
 | `board` | Safe GPIO startup, GPIO25-gated SHT30 and battery ADC, debounced semantic buttons |
-| `net` | NVS settings, non-blocking Wi-Fi provisioning, Bridge JSON client, four-site TCP latency probe, core-0 device API |
+| `net` | NVS settings, Wi-Fi provisioning, authenticated three-Agent client, device HTTP API |
 | `app` | Fixed-size shared model, semantic revision tracking, conservative refresh scheduling |
-| `ui` | Dashboard/system rendering and the only physical e-paper refresh entry point |
+| `ui` | Fleet/System rendering and the only physical e-paper refresh entry point |
 
-The HTTP task never calls the display. It only changes cached state or queues a
-refresh, so `/api/info` remains available during a roughly 21-second panel
-refresh. Outgoing Bridge polling and physical buttons still share the Arduino
-main loop and pause during the refresh; moving them to their own task is a P2
-improvement, not a P1 safety requirement.
+`DeviceServer` runs on Core 0 at priority 2. `AgentClient` is a low-priority
+Core 0 task. Button scanning and the display state machine run from the Arduino
+main loop on Core 1. An approximately 21-second physical refresh can pause
+button scanning, but it does not directly block the Core 0 HTTP or Agent tasks.
 
-Bridge connect and read phases are bounded to approximately three seconds in
-total. A transient HTTP error is recorded immediately, but an established
-Bridge is shown offline only after three consecutive failures; Wi-Fi loss,
-endpoint removal, and endpoint replacement remain immediate transitions.
+HTTP handlers expose read-only aggregates and never call the display. Agent
+endpoints, the shared Bearer token and the learned, NVS-pinned installation
+identities stay in `SettingsStore`/`AgentClient`. Only bounded,
+display-safe labels, task text, counts, enum states and timestamps enter
+`RuntimeState`.
 
-The network probe performs no TLS or HTTP transfer. Each result is the elapsed
-time for DNS resolution plus a plain TCP connection to port 443, bounded to
-1.2 seconds. Wi-Fi connection triggers a fast four-site warm-up; steady-state
-sampling is one target every 15 seconds, or about once per minute per site.
-Only one connection attempt is made from a task iteration. The probe owns a
-low-priority Core 0 task so DNS or TCP delay cannot block Core 1 button scans;
-the Core 0 HTTP task has higher priority.
+The legacy four-site DNS + TCP/443 `NetworkProbe` source remains available for
+historical diagnostics but is not started by `0.4.0-p1`. No probe task writes
+`RuntimeState`, no latency is rendered or returned by the device API, and
+latency jitter cannot trigger a physical refresh.
 
-Raw latency is always cached. Reachability and quality-band transitions bump
-the display revision immediately; otherwise one completed-round bucket out of
-five forces an exact-value redraw. This keeps the network page current on an
-e-paper timescale without turning small Wi-Fi jitter into near-continuous full
-refreshes.
+## Agent client
 
-The home page consumes only Codex fields from the Bridge. Bridge percentages
-are used percentages, so the renderer clamps and displays `100 - used`. The
-minute countdown and Bridge Unix timestamp are converted once into a stable
-absolute reset timestamp, then formatted in UTC+8. This avoids the displayed
-time creeping forward while the Bridge serves cached quota data.
+The client targets Codex Monitor Agent `0.4.x` schema `1.1`. It sends
+`Authorization: Bearer <token>` on every request and uses bounded streaming JSON
+parsers. It verifies schema major 1 and captures a stable `installation_id`
+through `GET /api/v1/version` before trusting `GET /api/v1/status`.
+
+One configured slot is polled every five seconds, so each of the three Agents
+is normally visited about every 15 seconds. If status reports known active
+threads, the same slot also requests `GET /api/v1/threads?limit=12`. Candidate
+task priority is approval, input, running, then error; equal-priority tasks use
+the most recent `updated_at`. Display text is normalized into a fixed ASCII
+buffer.
+
+Account `GET /api/v1/rate-limits` is polled on a 60-second cadence. A quota cycle
+starts at fixed primary slot 0 and falls back through the other slots even when
+the primary Agent's version/status request fails.
+The parser accepts a 6-to-8-day window from `rateLimits.primary` or
+`rateLimits.secondary`, treats `usedPercent` as used capacity, and stores the
+epoch `resetsAt`. The UI displays `100 - usedPercent` and formats reset as an
+absolute UTC+8 time.
+
+Transport failures first enter recovery and become offline after three
+consecutive failures. Wi-Fi loss immediately makes configured slots offline.
+HTTP 401 locks the slot as an auth error until settings change. Incompatible
+schema or a changed installation identity locks it as a protocol error until
+settings change. Unknown, unavailable, stale, idle and offline remain distinct
+states.
+
+The complete consumed-field and provisioning contract is in
+`../../docs/AGENT_PROTOCOL.md`.
+
+## Home and System pages
+
+Home is a flat two-column composition:
+
+- Left: shared Codex account, Weekly remaining percentage/bar, absolute reset
+  time, primary/fallback source label, availability and source update time.
+- Right: three Agent rows with live workload, current task, workflow/worker
+  counts, waiting/error/run counts, activity age and action-required emphasis.
+- Header: `CODEX FLEET`, Wi-Fi icon and live `N/3` only. Battery and the retired
+  Bridge icon are not shown.
+
+`N/3` counts only identity-verified, online, non-stale Agents. It is not the
+number of configured endpoints. Red is limited to the title accent, low quota,
+action-required and error/offline states.
+
+Temperature, humidity, approximate battery percentage/voltage, firmware and
+connectivity details remain on System. Home has no IP/subtitle row, button
+legend or bottom help copy.
 
 ## Display lifecycle
 
 The upstream GxEPD2 Z08 driver uses a `void` BUSY wait that merely logs a
-timeout. P1 therefore supplies a minimal, project-specific full-screen path:
+timeout. The product firmware therefore supplies a minimal, project-specific
+full-screen path:
 
 ```text
 Unknown / PoweredOff
@@ -94,22 +145,19 @@ NVS on every refresh, avoiding unnecessary flash wear.
 
 Only event-driven full refresh is enabled. Ordinary semantic changes wait at
 least 60 seconds; attention transitions and explicit requests still observe a
-30-second hard floor. P1 does not enable partial refresh.
+30-second hard floor. Partial refresh is not enabled.
 
 ## Device API
 
-| Method | Path | P1 behavior |
+| Method | Path | Current behavior |
 |---|---|---|
-| GET | `/api/info` | Device identity, approximate battery, four latency results, and sample-client compatibility fields |
-| GET | `/api/health` | Cached Wi-Fi/Bridge/heap, battery, and probe-round health |
-| POST | `/api/bridge` | Form field `host=ip_or_name[:port]`; persist and poll |
-| POST | `/api/display` | Form field `mode=auto|claude|codex` |
-| POST | `/api/refresh` | Queue a rate-limited refresh; never refresh in handler |
+| GET | `/api/info` | API/firmware/display metadata plus safe Wi-Fi, Agent and account aggregates |
+| GET | `/api/health` | Uptime, heap and safe Wi-Fi/Agent/account health aggregates |
 
-`/api/info` retains `mode`, `sprite_rev: 0`, and `brightness: 100` so the
-reference Windows client can discover the device. Its effective page-0 mode is
-now `codex`, regardless of the legacy mode setting. GIF/sprite endpoints and a
-root configuration web page are not implemented in P1.
+`/api/info` reports API version 2 and `showing=agent_fleet` or `system`. Neither
+read endpoint returns Agent hosts, token, installation IDs, device IP, SSID or
+MAC. There are no HTTP write routes; configuration, page changes and manual
+refresh remain local to USB serial or the physical buttons.
 
 ## Provisioning and buttons
 
@@ -119,24 +167,28 @@ root configuration web page are not implemented in P1.
 - After the device has connected once, a later disconnect uses automatic
   reconnect and does not reopen the portal or compete with the device API for
   port 80.
+- Three Agent endpoints and their shared token are accepted only through the
+  local USB serial command
+  `AGENTS <endpoint0> <endpoint1> <endpoint2> <token>`. Slot 0 is always
+  primary; the command and arguments must never be logged or echoed.
 - Right-side top-to-bottom order after the power switch: EN reset, Upper
   GPIO34, Middle GPIO35, Lower GPIO39.
 - Short press: Upper next page, Middle rate-limited refresh, Lower back.
-- Long press: Upper immediate Bridge poll, Middle System page, Lower Dashboard.
+- Long press: Upper immediate Agent poll, Middle System page, Lower Home.
 
 ## Feasibility verdict
 
 | Area | Verdict | Remaining proof |
 |---|---|---|
-| ESP32 firmware and panel | Feasible, high confidence | P1 full refresh, repeat refresh, refresh-interrupt test |
-| SHT30, battery, buttons | Feasible and P0-proven | Battery percentage is voltage-estimated; divider/chemistry calibration and enclosure temperature bias remain |
-| Existing Bridge protocol | Feasible, parser implemented | Build Bridge and perform live `/status` exchange |
-| Desktop Bridge protocol | Feasible with external reference | Build the pinned Windows or macOS reference, then replace it with an owned authenticated P2 implementation |
-| Sample-like visual result | Feasible within e-paper constraints | Typography polish and optional Chinese font later |
+| ESP32 firmware and panel | Feasible, high confidence | Re-run full refresh and refresh-interrupt tests for `0.4.0-p1` |
+| Three authenticated Agents | Feasible, implemented | Verify all reachable LAN routes, schema/identity locks, and one-Agent-offline degradation |
+| Shared Weekly account quota | Feasible, implemented | Confirm primary-first and fallback behavior with live CMA data |
+| Fleet UI | Feasible within e-paper constraints | Physical 800x480 visual acceptance and long-task truncation check |
+| SHT30, battery, buttons | Feasible and P0-proven | Battery calibration and enclosure temperature bias remain |
 | Animation/high-rate charts | Not suitable for this panel | Deliberately excluded |
 | Battery productization | Not yet proven | Current draw, low-voltage cutoff, sleep and runtime tests |
 
-The project is technically viable. The dominant product constraints are the
-panel's slow full refresh, no PSRAM, uncalibrated battery measurement, and the
-still-unmeasured behavior of panel high-voltage rails under a forced BUSY
-fault. None prevents the controlled P1 app0 test.
+The project remains technically viable. The dominant constraints are slow
+full refresh, no PSRAM, plain-HTTP Agent transport on a trusted LAN, one
+potentially unroutable Agent network, uncalibrated battery measurement, and
+unmeasured panel high-voltage behavior under a forced BUSY fault.

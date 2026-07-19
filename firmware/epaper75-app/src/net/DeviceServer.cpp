@@ -11,21 +11,44 @@ constexpr uint32_t kServerStackBytes = 8192;
 constexpr UBaseType_t kServerPriority = 2;
 constexpr BaseType_t kServerCore = 0;
 
-String endpointText(const app::BridgeEndpoint& endpoint) {
-  if (!endpoint.configured()) return String();
-  String value;
-  value.reserve(strlen(endpoint.host) + 7);
-  value += endpoint.host;
-  value += ':';
-  value += endpoint.port;
-  return value;
+uint8_t fleetConfiguredCount(const app::AgentFleetSnapshot& fleet) {
+  uint8_t count = 0;
+  for (const app::AgentDeviceSnapshot& device : fleet.devices) {
+    if (device.reachability != app::AgentReachability::Unconfigured) ++count;
+  }
+  return count;
+}
+
+void addAccountAggregate(JsonDocument& document,
+                         const app::AccountQuotaSnapshot& account) {
+  JsonObject output = document["account"].to<JsonObject>();
+  output["availability"] = app::dataAvailabilityName(account.availability);
+  output["stale"] = account.stale;
+  const int16_t weeklyRemaining =
+      app::accountWeeklyRemainingPercent(account);
+  if (weeklyRemaining >= 0) {
+    output["weekly_remaining_percent"] = weeklyRemaining;
+  } else {
+    output["weekly_remaining_percent"] = nullptr;
+  }
+  if (account.weeklyResetTimestamp > 0) {
+    output["weekly_reset_at"] = account.weeklyResetTimestamp;
+  } else {
+    output["weekly_reset_at"] = nullptr;
+  }
+  if (account.receivedAtMs != 0) {
+    output["updated_age_s"] =
+        static_cast<uint32_t>(millis() - account.receivedAtMs) / 1000U;
+  } else {
+    output["updated_age_s"] = nullptr;
+  }
 }
 
 }  // namespace
 
-DeviceServer::DeviceServer(app::RuntimeState& state, SettingsStore& settings,
+DeviceServer::DeviceServer(app::RuntimeState& state,
                            const char* firmwareVersion)
-    : state_(state), settings_(settings) {
+    : state_(state) {
   strlcpy(firmwareVersion_, firmwareVersion == nullptr ? "p1" : firmwareVersion,
           sizeof(firmwareVersion_));
 }
@@ -93,9 +116,6 @@ void DeviceServer::configureRoutes() {
   if (routesConfigured_) return;
   server_.on("/api/info", HTTP_GET, [this]() { handleInfo(); });
   server_.on("/api/health", HTTP_GET, [this]() { handleHealth(); });
-  server_.on("/api/bridge", HTTP_POST, [this]() { handleBridge(); });
-  server_.on("/api/display", HTTP_POST, [this]() { handleDisplay(); });
-  server_.on("/api/refresh", HTTP_POST, [this]() { handleRefresh(); });
   server_.onNotFound([this]() { handleNotFound(); });
   routesConfigured_ = true;
 }
@@ -104,68 +124,22 @@ void DeviceServer::handleInfo() {
   const app::UiModel model = state_.snapshot();
   JsonDocument document;
   document["device_type"] = "epaper75";
-  document["api_version"] = 1;
+  document["api_version"] = 2;
   document["fw"] = firmwareVersion_;
-  document["ip"] = model.network.ip;
-  document["ssid"] = model.network.ssid;
-  document["bridge"] = endpointText(model.endpoint);
+  document["wifi_connected"] = model.network.connected;
   document["mode"] = app::displayModeName(model.mode);
-  // Keep the legacy mode field for Bridge compatibility. P1 v0.2 always
-  // renders Codex usage plus network latency on page 0.
-  document["effective"] = "codex";
-  document["showing"] = (model.page % 2U) == 0U ? "codex_network" : "system";
-  document["last_update_s"] =
-      model.bridge.receivedAtMs == 0
-          ? -1
-          : static_cast<int32_t>((millis() - model.bridge.receivedAtMs) / 1000);
-  document["sprite_rev"] = 0;
-  document["brightness"] = 100;
+  document["showing"] = (model.page % 2U) == 0U ? "agent_fleet" : "system";
   document["display_width"] = 800;
   document["display_height"] = 480;
   document["revision"] = model.revision;
-
-  JsonObject battery = document["battery"].to<JsonObject>();
-  battery["estimated"] = true;
-  battery["millivolts"] = model.telemetry.batteryMillivolts;
-  if (model.telemetry.batteryPercent >= 0) {
-    battery["percent"] = model.telemetry.batteryPercent;
-  } else {
-    battery["percent"] = nullptr;
-  }
-
-  JsonArray latency = document["network_latency"].to<JsonArray>();
-  for (size_t i = 0; i < app::kLatencyTargetCount; ++i) {
-    const app::LatencyTargetSnapshot& target =
-        model.networkQuality.targets[i];
-    JsonObject item = latency.add<JsonObject>();
-    item["name"] = target.name;
-    item["reachable"] = target.sampledAtMs != 0 && target.reachable;
-    if (target.sampledAtMs != 0 && target.reachable && target.latencyMs >= 0) {
-      item["latency_ms"] = target.latencyMs;
-    } else {
-      item["latency_ms"] = nullptr;
-    }
-    item["sampled"] = target.sampledAtMs != 0;
-  }
-  document["network_probe"] = "dns_tcp_443";
-  document["network_probe_rounds"] = model.networkQuality.completedRounds;
-
-  JsonObject claude = document["claude"].to<JsonObject>();
-  claude["status"] = model.bridge.claude.status;
-  claude["needs_input"] = model.bridge.claude.needsInput;
-  claude["custom_sprite"] = false;
-  claude["w"] = 0;
-  claude["h"] = 0;
-
-  JsonObject codex = document["codex"].to<JsonObject>();
-  codex["status"] = model.bridge.codex.status;
-  codex["needs_input"] = model.bridge.codex.needsInput;
-  codex["custom_sprite"] = false;
-  codex["w"] = 0;
-  codex["h"] = 0;
+  document["agents_configured"] = fleetConfiguredCount(model.fleet);
+  document["agents_online"] = app::fleetOnlineCount(model.fleet);
+  document["agents_action_required"] = app::fleetActionCount(model.fleet);
+  document["agents_error"] = app::fleetErrorCount(model.fleet);
+  addAccountAggregate(document, model.fleet.account);
 
   String output;
-  output.reserve(1400);
+  output.reserve(512);
   serializeJson(document, output);
   sendJson(200, output);
 }
@@ -176,68 +150,17 @@ void DeviceServer::handleHealth() {
   document["ok"] = true;
   document["uptime_ms"] = millis();
   document["wifi_connected"] = model.network.connected;
-  document["bridge_configured"] = model.endpoint.configured();
-  document["bridge_reachable"] = model.bridge.reachable;
-  document["battery_percent_estimate"] =
-      model.telemetry.batteryPercent >= 0
-          ? static_cast<int>(model.telemetry.batteryPercent)
-          : -1;
-  document["network_probe_rounds"] = model.networkQuality.completedRounds;
+  document["agents_configured"] = fleetConfiguredCount(model.fleet);
+  document["agents_online"] = app::fleetOnlineCount(model.fleet);
+  document["agents_action_required"] = app::fleetActionCount(model.fleet);
+  document["agents_error"] = app::fleetErrorCount(model.fleet);
+  document["account_availability"] =
+      app::dataAvailabilityName(model.fleet.account.availability);
   document["free_heap"] = ESP.getFreeHeap();
   String output;
-  output.reserve(192);
+  output.reserve(256);
   serializeJson(document, output);
   sendJson(200, output);
-}
-
-void DeviceServer::handleBridge() {
-  if (!server_.hasArg("host")) {
-    sendError(400, "missing host");
-    return;
-  }
-
-  app::BridgeEndpoint endpoint;
-  if (!parseBridgeEndpoint(server_.arg("host").c_str(), endpoint)) {
-    sendError(400, "host must be ip_or_name[:port]");
-    return;
-  }
-  if (!settings_.saveBridge(endpoint)) {
-    sendError(500, "failed to persist bridge");
-    return;
-  }
-
-  state_.setBridgeEndpoint(endpoint);
-  app::BridgeSnapshot unavailable = state_.snapshot().bridge;
-  unavailable.reachable = false;
-  state_.updateBridge(unavailable);
-  state_.requestRefresh();
-  sendJson(200, "{\"ok\":true}");
-}
-
-void DeviceServer::handleDisplay() {
-  if (!server_.hasArg("mode")) {
-    sendError(400, "missing mode");
-    return;
-  }
-
-  app::DisplayMode mode;
-  if (!app::parseDisplayMode(server_.arg("mode").c_str(), mode)) {
-    sendError(400, "mode must be auto|claude|codex");
-    return;
-  }
-  if (!settings_.saveDisplayMode(mode)) {
-    sendError(500, "failed to persist display mode");
-    return;
-  }
-
-  state_.setDisplayMode(mode);
-  state_.requestRefresh();
-  sendJson(200, "{\"ok\":true}");
-}
-
-void DeviceServer::handleRefresh() {
-  state_.requestRefresh();
-  sendJson(200, "{\"ok\":true,\"queued\":true}");
 }
 
 void DeviceServer::handleNotFound() { sendError(404, "not found"); }

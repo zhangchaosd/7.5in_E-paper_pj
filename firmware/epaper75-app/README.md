@@ -1,8 +1,9 @@
-# Epaper75 P1 application
+# Epaper75 0.4 application
 
-This is the first product-oriented firmware for the recovered ESP32 e-paper
-device.  It is intentionally separate from `epaper75-bringup`, which remains
-the immutable P0 hardware diagnostic and rollback reference.
+This is the product firmware for the recovered ESP32 e-paper device. The
+current development version is `0.4.0-p1`. It is intentionally separate from
+`epaper75-bringup`, which remains the P0 hardware diagnostic and rollback
+reference.
 
 ## Confirmed hardware target
 
@@ -16,37 +17,39 @@ the immutable P0 hardware diagnostic and rollback reference.
 - Right-side order from top to bottom after USB-C and the power switch:
   hardware EN reset, GPIO34 (Upper), GPIO35 (Middle), GPIO39 (Lower)
 
-## P1 behavior
+## Current behavior
 
 - Keeps Wi-Fi credentials in the existing ESP32 Wi-Fi/NVS store and opens the
   `Epaper75-Setup` captive portal only when normal connection fails.
-- Polls an external desktop Bridge at `GET /status` without changing its JSON
-  contract.
-- Serves a compatibility API on port 80: `/api/info`, `/api/bridge`,
-  `/api/display`, `/api/refresh`, and `/api/health`.
-- Renders a full-refresh, dual-column home page: Codex quota on the left and
-  four-site network latency on the right. Claude is still accepted in the
-  Bridge compatibility payload but is not shown.
-- Codex bars show **remaining** quota (`100 - used_percent`), so a reset starts
-  full and normal use drains the bar. Reset times are rendered as absolute
-  `YYYY-MM-DD HH:MM` clock times in UTC+8 rather than countdowns.
-- Measures DNS + TCP/443 connection time to NetEase Cloud Music, GitHub,
-  Google, and YouTube. The first round is fast; afterward each site is sampled
-  about once per minute. This is connection latency, not ICMP ping or full page
-  load time.
+- Polls three Codex Monitor Agent `0.4.x` installations with a shared Bearer
+  token and the schema `1.1` contract. One Agent slot is polled every five
+  seconds, so each installation is normally visited about every 15 seconds.
+- Serves a privacy-bounded, read-only API on port 80: `/api/info` and
+  `/api/health`. There are no HTTP write routes or network endpoints for Agent
+  credentials.
+- Renders a full-refresh, dual-column Home page: shared Codex account Weekly
+  data on the left and three independent Agent activity rows on the right.
+- Agent slot 0 is the fixed preferred account source. Because all three
+  installations share one account, another identity-verified Agent may provide
+  fallback Weekly data.
+- The Weekly bar shows **remaining** quota (`100 - used_percent`), so a reset
+  starts full and normal use drains the bar. Reset time is an absolute
+  `YYYY-MM-DD HH:MM` clock time in UTC+8, not a countdown.
+- Each device row distinguishes running, approval, input, idle, error, stale,
+  offline, authentication and protocol states. Unknown is not treated as idle.
 - Shows a voltage-derived battery estimate as `~NN%`. The board has no fuel
   gauge IC, so the result is intentionally marked approximate until the ADC
-  divider is calibrated against a multimeter.
-- Uses a compact single-line header: title, battery icon/percentage, Wi-Fi
-  icon, and Bridge link icon. Online icons are black; offline/critical icons
-  are red. The former device/IP second line and home-page footnotes are omitted.
-- Uses a flat two-column composition rather than nested cards: large remaining
-  percentages and bars on the left, one continuous four-row latency table on
-  the right. Lines are reserved for hierarchy and row separation.
+  divider is calibrated against a multimeter. Battery remains on System and is
+  not shown in the Home header.
+- Uses a compact single-line header with title, Wi-Fi icon, and live `N/3`
+  Agent count only. The retired Bridge icon, battery, device/IP second line and
+  Home footnotes are omitted.
+- Does not start the legacy four-site `NetworkProbe`; Home and the device API
+  no longer provide network-latency data.
 - Keeps temperature and humidity on the System page only. Normal display
   changes are rate-limited to protect the panel.
-- Runs the HTTP API on the other ESP32 core, so a roughly 21-second e-paper
-  refresh does not make discovery endpoints disappear.
+- Runs the HTTP API and Agent client on Core 0, so a roughly 21-second e-paper
+  refresh does not make discovery endpoints or Agent polling disappear.
 
 The screen deliberately contains no button legend. In the final right-edge
 orientation, short presses are Upper (next page), Middle (refresh), and Lower
@@ -97,22 +100,29 @@ powershell -ExecutionPolicy Bypass -File .\tools\flash_app0_only.ps1 `
 This deliberately leaves the bootloader, partition table, NVS, OTA metadata,
 factory app1, and SPIFFS untouched.
 
-## Bridge prerequisite
+## Agent prerequisite and configuration
 
-The verified reference Bridge is an external project and is not vendored here.
-Clone and build the pinned revision described in `../../docs/BRIDGE_PROTOCOL.md`,
-then point the helper at that external checkout:
+Run a compatible Codex Monitor Agent on each of the three desktop devices. The
+firmware targets CMA `0.4.x` schema `1.1` and authenticates every JSON request
+with one shared Bearer token. The Agent executable and local contract copies
+are not vendored into this repository.
 
-```powershell
-powershell -ExecutionPolicy Bypass -File .\tools\start_reference_bridge.ps1 `
-  -BridgeRoot C:\path\to\esp8266-ai
-powershell -ExecutionPolicy Bypass -File .\tools\stop_reference_bridge.ps1
+Provision all three endpoints and the token over a locally controlled USB
+serial session at 115200 baud:
+
+```text
+AGENTS <endpoint0> <endpoint1> <endpoint2> <shared-token>
 ```
 
-```bash
-./tools/start_reference_bridge.sh /path/to/esp8266-ai
-```
+Slot 0 is always the primary account source. The firmware stores the complete
+setting in its private NVS blob and only prints a sanitized success or failure
+message; it does not echo arguments. Full field rules, polling behavior and
+failure semantics are in
+[`../../docs/AGENT_PROTOCOL.md`](../../docs/AGENT_PROTOCOL.md).
 
-The Bridge remains an unmodified external reference implementation for P1. A
-later owned P2 implementation can add formal `device_type=epaper75` validation,
-pairing authentication, and e-paper-specific menu choices.
+Never put real endpoints, tokens, the raw serial command or installation IDs in
+source, Git, shell history, terminal logs, screenshots or test output. The
+firmware deliberately has no `/api/agents` or Wi-Fi provisioning field for
+these secrets. The retired Bridge workflow is documented only as a historical
+migration pointer in `../../docs/BRIDGE_PROTOCOL.md` and is not required by
+`0.4.x`.

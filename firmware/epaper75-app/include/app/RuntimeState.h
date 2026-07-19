@@ -15,13 +15,11 @@ class RuntimeState {
   RuntimeState();
 
   UiModel snapshot() const;
-  BridgeEndpoint bridgeEndpoint() const;
 
   bool updateNetwork(const NetworkSnapshot& value);
   bool updateNetworkQuality(const NetworkQualitySnapshot& value);
   bool updateTelemetry(const TelemetrySnapshot& value);
-  bool updateBridge(const BridgeSnapshot& value);
-  bool setBridgeEndpoint(const BridgeEndpoint& value);
+  bool updateFleet(const AgentFleetSnapshot& value);
   bool setDisplayMode(DisplayMode value);
   bool setPage(uint8_t value);
 

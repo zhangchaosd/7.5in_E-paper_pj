@@ -8,43 +8,31 @@
 #include "app/RuntimeState.h"
 #include "board/Board.h"
 #include "board/BoardConfig.h"
-#include "net/BridgeClient.h"
+#include "net/AgentClient.h"
 #include "net/Connectivity.h"
 #include "net/DeviceServer.h"
-#include "net/NetworkProbe.h"
 #include "net/SettingsStore.h"
 #include "ui/EpdController.h"
 
 namespace {
 
-static_assert(app::kLatencyTargetCount == net::kNetworkProbeTargetCount,
-              "UI and network probe target counts must match");
-
 app::RuntimeState runtimeState;
 board::Board deviceBoard;
 net::SettingsStore settingsStore;
 net::Connectivity connectivity(runtimeState);
-net::BridgeClient bridgeClient(runtimeState, board::kBridgePollPeriodMs);
-net::DeviceServer deviceServer(runtimeState, settingsStore,
-                               board::kFirmwareVersion);
-net::NetworkProbe networkProbe;
+net::AgentClient agentClient(runtimeState, settingsStore,
+                             board::kAgentPollSlotPeriodMs);
+net::DeviceServer deviceServer(runtimeState, board::kFirmwareVersion);
 ui::EpdController epd;
 app::RefreshPolicy refreshPolicy;
 
-constexpr uint32_t kNetworkProbeTaskStackBytes = 6144;
-constexpr UBaseType_t kNetworkProbeTaskPriority = 1;
-constexpr BaseType_t kNetworkProbeTaskCore = 0;
-TaskHandle_t networkProbeTaskHandle = nullptr;
-
-char serialLine[128] = {};
+char serialLine[320] = {};
 size_t serialLength = 0;
 bool serverStarted = false;
 uint32_t lastServerAttemptAtMs = 0;
+uint32_t lastAgentTaskAttemptAtMs = 0;
 uint32_t lastSensorSampleAtMs = 0;
-bool networkProbePublished = false;
-uint32_t lastNetworkProbeUpdatedAtMs = 0;
-uint32_t lastNetworkProbeCompletedRounds = 0;
-// Give stored Wi-Fi credentials and the first Bridge poll a chance to settle
+// Give stored Wi-Fi credentials and the first Agent poll a chance to settle
 // before committing a 20+ second physical refresh.  If no Wi-Fi is available,
 // the system page is drawn just before the provisioning portal starts.
 constexpr uint32_t kInitialDisplayGraceMs = 10000;
@@ -75,83 +63,6 @@ void publishTelemetry() {
   }
 }
 
-void publishNetworkQuality() {
-  const net::NetworkProbeSnapshot probe = networkProbe.snapshot();
-  // The probe is initialized inside its owning task. Avoid publishing the
-  // zero-initialized pre-task snapshot and then suppressing the named one.
-  if (probe.targets[0].name[0] == '\0') return;
-  if (networkProbePublished &&
-      probe.updatedAtMs == lastNetworkProbeUpdatedAtMs &&
-      probe.completedRounds == lastNetworkProbeCompletedRounds) {
-    return;
-  }
-
-  app::NetworkQualitySnapshot snapshot;
-  snapshot.updatedAtMs = probe.updatedAtMs;
-  snapshot.completedRounds = probe.completedRounds;
-  for (size_t i = 0; i < app::kLatencyTargetCount; ++i) {
-    app::copyText(snapshot.targets[i].name, probe.targets[i].name);
-    snapshot.targets[i].latencyMs = probe.targets[i].latencyMs;
-    snapshot.targets[i].sampledAtMs = probe.targets[i].sampledAtMs;
-    snapshot.targets[i].reachable = probe.targets[i].reachable;
-  }
-  runtimeState.updateNetworkQuality(snapshot);
-  networkProbePublished = true;
-  lastNetworkProbeUpdatedAtMs = probe.updatedAtMs;
-  lastNetworkProbeCompletedRounds = probe.completedRounds;
-
-  if (probe.updatedAtMs != 0) {
-    for (size_t i = 0; i < net::kNetworkProbeTargetCount; ++i) {
-      if (probe.targets[i].sampledAtMs != probe.updatedAtMs) continue;
-      if (probe.targets[i].reachable) {
-        Serial.printf("[network] %s TCP/443 %ld ms\n",
-                      probe.targets[i].name,
-                      static_cast<long>(probe.targets[i].latencyMs));
-      } else {
-        Serial.printf("[network] %s TCP/443 unavailable\n",
-                      probe.targets[i].name);
-      }
-      break;
-    }
-  }
-}
-
-void networkProbeTaskEntry(void*) {
-  networkProbe.begin();
-  for (;;) {
-    networkProbe.loop();
-    vTaskDelay(pdMS_TO_TICKS(20));
-  }
-}
-
-void startNetworkProbe() {
-  const BaseType_t created = xTaskCreatePinnedToCore(
-      networkProbeTaskEntry, "ep75-netprobe", kNetworkProbeTaskStackBytes,
-      nullptr, kNetworkProbeTaskPriority, &networkProbeTaskHandle,
-      kNetworkProbeTaskCore);
-  if (created == pdPASS) {
-    Serial.println("[network] probe task started on core 0");
-    return;
-  }
-
-  networkProbeTaskHandle = nullptr;
-  // Preserve button responsiveness even under memory pressure. A synchronous
-  // fallback could block the button loop in DNS/TCP for seconds, so publish a
-  // disabled/offline snapshot instead.
-  constexpr const char* names[app::kLatencyTargetCount] = {
-      "NetEase", "GitHub", "Google", "YouTube"};
-  app::NetworkQualitySnapshot unavailable;
-  unavailable.updatedAtMs = millis();
-  for (size_t i = 0; i < app::kLatencyTargetCount; ++i) {
-    app::copyText(unavailable.targets[i].name, names[i]);
-    unavailable.targets[i].sampledAtMs = unavailable.updatedAtMs;
-    unavailable.targets[i].reachable = false;
-    unavailable.targets[i].latencyMs = -1;
-  }
-  runtimeState.updateNetworkQuality(unavailable);
-  Serial.println("[network] probe task start failed; probe disabled");
-}
-
 void printInfo() {
   const app::UiModel model = runtimeState.snapshot();
   Serial.println("=== Epaper75 P1 ===");
@@ -160,26 +71,23 @@ void printInfo() {
                 static_cast<unsigned long>(ESP.getFreeHeap()),
                 static_cast<unsigned long>(ESP.getFlashChipSize()),
                 static_cast<unsigned long>(ESP.getPsramSize()));
-  Serial.printf("wifi=%s ip=%s rssi=%d\n",
+  Serial.printf("wifi=%s rssi=%d agents=%u/%u action=%u account=%s%s\n",
                 model.network.connected ? "connected" : "offline",
-                model.network.ip, model.network.rssi);
-  Serial.printf("bridge=%s%s%s:%u reachable=%s\n",
-                model.endpoint.configured() ? "" : "(not configured) ",
-                model.endpoint.host,
-                model.endpoint.configured() ? "" : "-",
-                model.endpoint.port,
-                model.bridge.reachable ? "yes" : "no");
+                model.network.rssi,
+                static_cast<unsigned>(app::fleetOnlineCount(model.fleet)),
+                static_cast<unsigned>(app::kAgentDeviceCount),
+                static_cast<unsigned>(app::fleetActionCount(model.fleet)),
+                app::dataAvailabilityName(model.fleet.account.availability),
+                model.fleet.account.stale ? " stale" : "");
   Serial.printf("mode=%s page=%u model_rev=%lu panel=%s error=%s\n",
                 app::displayModeName(model.mode), model.page,
                 static_cast<unsigned long>(model.revision),
                 ui::panelJournalStateName(epd.journalState()),
                  ui::epdErrorName(epd.lastError()));
   if (model.telemetry.batteryPercent >= 0) {
-    Serial.printf("battery=%u mV (~%d%%) network_rounds=%lu\n",
+    Serial.printf("battery=%u mV (~%d%%)\n",
                   model.telemetry.batteryMillivolts,
-                  model.telemetry.batteryPercent,
-                  static_cast<unsigned long>(
-                      model.networkQuality.completedRounds));
+                  model.telemetry.batteryPercent);
   }
 }
 
@@ -187,11 +95,11 @@ void printHelp() {
   Serial.println("Commands:");
   Serial.println("  INFO                  cached device state");
   Serial.println("  SENSOR                sample SHT30 and battery now");
-  Serial.println("  POLL                  request an immediate Bridge poll");
+  Serial.println("  POLL                  request an immediate Agent poll");
+  Serial.println("  AGENTS ...            write private Agent settings over USB");
   Serial.println("  REFRESH               request a rate-limited full refresh");
   Serial.println("  PAGE 0|1              dashboard or system page");
   Serial.println("  MODE auto|claude|codex");
-  Serial.println("  BRIDGE host[:port]    persist Bridge endpoint");
   Serial.println("  HELP");
 }
 
@@ -220,8 +128,8 @@ void handleSerialCommand(char* input) {
     return;
   }
   if (strcasecmp(command, "POLL") == 0) {
-    bridgeClient.requestImmediatePoll();
-    Serial.println("[bridge] immediate poll requested");
+    agentClient.requestImmediatePoll();
+    Serial.println("[agents] immediate poll requested");
     return;
   }
   if (strcasecmp(command, "REFRESH") == 0) {
@@ -248,6 +156,41 @@ void handleSerialCommand(char* input) {
     return;
   }
 
+  if (strcasecmp(command, "AGENTS") == 0) {
+    net::AgentFleetSettings agents;
+    char* save = nullptr;
+    bool valid = true;
+    for (size_t i = 0; i < app::kAgentDeviceCount; ++i) {
+      char* endpoint = strtok_r(i == 0 ? argument : nullptr, " \t", &save);
+      if (endpoint == nullptr ||
+          !net::parseAgentEndpoint(endpoint, agents.endpoints[i])) {
+        valid = false;
+        break;
+      }
+    }
+    char* token = valid ? strtok_r(nullptr, " \t", &save) : nullptr;
+    char* extra = token != nullptr ? strtok_r(nullptr, " \t", &save) : nullptr;
+    if (token == nullptr || extra != nullptr ||
+        !net::validateAgentToken(token)) {
+      valid = false;
+    }
+    if (valid) {
+      strlcpy(agents.token, token, sizeof(agents.token));
+      agents.primaryIndex = 0;
+      valid = settingsStore.saveAgents(agents);
+      memset(agents.token, 0, sizeof(agents.token));
+    }
+    if (!valid) {
+      Serial.println("Agent settings rejected.");
+      return;
+    }
+    agentClient.requestImmediatePoll();
+    runtimeState.setPage(0);
+    runtimeState.requestRefresh();
+    Serial.println("[agents] private settings stored");
+    return;
+  }
+
   if (strcasecmp(command, "MODE") == 0) {
     app::DisplayMode mode;
     if (!app::parseDisplayMode(argument, mode)) {
@@ -264,23 +207,6 @@ void handleSerialCommand(char* input) {
     return;
   }
 
-  if (strcasecmp(command, "BRIDGE") == 0) {
-    app::BridgeEndpoint endpoint;
-    if (!net::parseBridgeEndpoint(argument, endpoint)) {
-      Serial.println("Invalid endpoint. Use host[:port], without http:// or a path.");
-      return;
-    }
-    if (!settingsStore.saveBridge(endpoint)) {
-      Serial.println("Failed to persist Bridge endpoint.");
-      return;
-    }
-    runtimeState.setBridgeEndpoint(endpoint);
-    runtimeState.requestRefresh();
-    bridgeClient.requestImmediatePoll();
-    Serial.printf("bridge=%s:%u\n", endpoint.host, endpoint.port);
-    return;
-  }
-
   Serial.println("Unknown command. Type HELP.");
 }
 
@@ -291,6 +217,7 @@ void pollSerial() {
       if (serialLength > 0) {
         serialLine[serialLength] = '\0';
         handleSerialCommand(serialLine);
+        memset(serialLine, 0, sizeof(serialLine));
         serialLength = 0;
       }
       continue;
@@ -310,7 +237,7 @@ void handleButtonEvent(const board::ButtonEvent& event) {
   if (event.gesture == board::ButtonGesture::LongPress) {
     switch (event.button) {
       case board::ButtonId::Upper:
-        bridgeClient.requestImmediatePoll();
+        agentClient.requestImmediatePoll();
         break;
       case board::ButtonId::Middle:
         if (runtimeState.setPage(1)) runtimeState.requestRefresh();
@@ -418,17 +345,15 @@ void setup() {
 
   net::StoredSettings stored;
   settingsStore.load(stored);
-  runtimeState.setBridgeEndpoint(stored.bridge);
   runtimeState.setDisplayMode(stored.mode);
-  if (!stored.bridge.configured()) runtimeState.setPage(1);
+  if (!stored.agents.ready()) runtimeState.setPage(1);
 
   publishTelemetry();
   connectivity.begin();
   runtimeState.updateNetwork(connectivity.snapshot());
-  bridgeClient.begin();
-  startNetworkProbe();
-  publishNetworkQuality();
-
+  lastAgentTaskAttemptAtMs = millis();
+  Serial.printf("[agents] polling task %s\n",
+                agentClient.begin() ? "started on core 0" : "start failed");
   printHelp();
   printInfo();
 }
@@ -441,9 +366,12 @@ void loop() {
   connectivity.loop();
   runtimeState.updateNetwork(connectivity.snapshot());
   ensureDeviceServer(nowMs);
-  bridgeClient.loop();
-  publishNetworkQuality();
-
+  if (!agentClient.running() &&
+      nowMs - lastAgentTaskAttemptAtMs >= 10000U) {
+    lastAgentTaskAttemptAtMs = nowMs;
+    Serial.printf("[agents] polling task retry %s\n",
+                  agentClient.begin() ? "accepted" : "failed");
+  }
   if (nowMs - lastSensorSampleAtMs >= board::kSensorPeriodMs) {
     publishTelemetry();
   }

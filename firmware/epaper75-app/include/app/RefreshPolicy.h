@@ -26,8 +26,8 @@ class RefreshPolicy {
   bool pending_ = false;
   bool urgentPending_ = false;
   bool forcedPending_ = false;
-  bool observedBridgeReachable_ = false;
-  bool observedCodexNeedsInput_ = false;
+  bool haveObservedFleet_ = false;
+  AgentFleetSnapshot observedFleet_;
 };
 
 }  // namespace app

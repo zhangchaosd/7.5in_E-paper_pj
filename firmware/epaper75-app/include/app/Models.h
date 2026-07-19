@@ -8,13 +8,45 @@
 
 namespace app {
 
-constexpr size_t kStatusTextSize = 20;
+// Configuration storage uses this bound, but hosts never enter UiModel.
 constexpr size_t kHostTextSize = 64;
 constexpr size_t kSsidTextSize = 33;
 constexpr size_t kIpTextSize = 16;
 constexpr size_t kLatencyTargetCount = 4;
 constexpr size_t kLatencyNameSize = 12;
+constexpr size_t kAgentDeviceCount = 3;
+constexpr size_t kDeviceLabelSize = 16;
+constexpr size_t kTaskTextSize = 34;
+constexpr uint8_t kNoAgentDevice = UINT8_MAX;
+constexpr uint32_t kUnknownActivityAgeSeconds = UINT32_MAX;
 
+enum class DataAvailability : uint8_t {
+  Unknown = 0,
+  Available,
+  Unavailable,
+};
+
+enum class AgentReachability : uint8_t {
+  Unconfigured = 0,
+  Connecting,
+  Online,
+  Recovering,
+  Offline,
+  AuthError,
+  ProtocolError,
+};
+
+enum class WorkloadState : uint8_t {
+  Running = 0,
+  WaitingApproval,
+  WaitingInput,
+  Idle,
+  Error,
+  Unknown,
+};
+
+// Kept for the existing display settings/API surface. Fleet data itself is
+// Codex-only; Auto and Codex therefore render the same account data.
 enum class DisplayMode : uint8_t { Auto = 0, Claude = 1, Codex = 2 };
 
 inline const char* displayModeName(DisplayMode mode) {
@@ -31,11 +63,118 @@ inline const char* displayModeName(DisplayMode mode) {
 
 inline bool parseDisplayMode(const char* value, DisplayMode& mode) {
   if (value == nullptr) return false;
-  if (strcasecmp(value, "auto") == 0) mode = DisplayMode::Auto;
-  else if (strcasecmp(value, "claude") == 0) mode = DisplayMode::Claude;
-  else if (strcasecmp(value, "codex") == 0) mode = DisplayMode::Codex;
-  else return false;
+  if (strcasecmp(value, "auto") == 0) {
+    mode = DisplayMode::Auto;
+  } else if (strcasecmp(value, "claude") == 0) {
+    mode = DisplayMode::Claude;
+  } else if (strcasecmp(value, "codex") == 0) {
+    mode = DisplayMode::Codex;
+  } else {
+    return false;
+  }
   return true;
+}
+
+inline const char* dataAvailabilityName(DataAvailability value) {
+  switch (value) {
+    case DataAvailability::Available:
+      return "available";
+    case DataAvailability::Unavailable:
+      return "unavailable";
+    case DataAvailability::Unknown:
+    default:
+      return "unknown";
+  }
+}
+
+inline const char* dataAvailabilityLabel(DataAvailability value) {
+  switch (value) {
+    case DataAvailability::Available:
+      return "CURRENT";
+    case DataAvailability::Unavailable:
+      return "UNAVAILABLE";
+    case DataAvailability::Unknown:
+    default:
+      return "UNKNOWN";
+  }
+}
+
+inline const char* agentReachabilityName(AgentReachability value) {
+  switch (value) {
+    case AgentReachability::Unconfigured:
+      return "unconfigured";
+    case AgentReachability::Connecting:
+      return "connecting";
+    case AgentReachability::Online:
+      return "online";
+    case AgentReachability::Recovering:
+      return "recovering";
+    case AgentReachability::Offline:
+      return "offline";
+    case AgentReachability::AuthError:
+      return "auth_error";
+    case AgentReachability::ProtocolError:
+      return "protocol_error";
+    default:
+      return "unconfigured";
+  }
+}
+
+inline const char* agentReachabilityLabel(AgentReachability value) {
+  switch (value) {
+    case AgentReachability::Unconfigured:
+      return "NOT SET";
+    case AgentReachability::Connecting:
+      return "CONNECTING";
+    case AgentReachability::Online:
+      return "ONLINE";
+    case AgentReachability::Recovering:
+      return "RECOVERING";
+    case AgentReachability::Offline:
+      return "OFFLINE";
+    case AgentReachability::AuthError:
+      return "AUTH ERROR";
+    case AgentReachability::ProtocolError:
+      return "PROTOCOL ERROR";
+    default:
+      return "NOT SET";
+  }
+}
+
+inline const char* workloadStateName(WorkloadState value) {
+  switch (value) {
+    case WorkloadState::Running:
+      return "RUNNING";
+    case WorkloadState::WaitingApproval:
+      return "WAITING_APPROVAL";
+    case WorkloadState::WaitingInput:
+      return "WAITING_INPUT";
+    case WorkloadState::Idle:
+      return "IDLE";
+    case WorkloadState::Error:
+      return "ERROR";
+    case WorkloadState::Unknown:
+    default:
+      return "UNKNOWN";
+  }
+}
+
+inline const char* workloadStateLabel(WorkloadState value) {
+  switch (value) {
+    case WorkloadState::Running:
+      return "RUNNING";
+    case WorkloadState::WaitingApproval:
+      return "APPROVAL";
+    case WorkloadState::WaitingInput:
+      return "INPUT";
+    case WorkloadState::Idle:
+      return "IDLE";
+    case WorkloadState::Error:
+      return "ERROR";
+    case WorkloadState::Unknown:
+    default:
+      return "UNKNOWN";
+  }
 }
 
 template <size_t N>
@@ -44,35 +183,40 @@ inline void copyText(char (&destination)[N], const char* source) {
   strlcpy(destination, source, N);
 }
 
-struct BridgeEndpoint {
-  char host[kHostTextSize] = {};
-  uint16_t port = 8765;
-
-  bool configured() const { return host[0] != '\0'; }
-};
-
-struct AgentSnapshot {
-  char status[kStatusTextSize] = "offline";
-  int32_t tokensToday = 0;
-  int32_t sessionMinutes = -1;
-  int32_t sessionWindowMinutes = -1;
-  int16_t primaryPercent = -1;
-  int32_t primaryWindowMinutes = -1;
-  int32_t primaryResetMinutes = -1;
-  int64_t primaryResetTimestamp = 0;
-  int16_t secondaryPercent = -1;
-  int32_t secondaryWindowMinutes = -1;
-  int32_t secondaryResetMinutes = -1;
-  int64_t secondaryResetTimestamp = 0;
-  bool needsInput = false;
-};
-
-struct BridgeSnapshot {
-  bool reachable = false;
-  int64_t sourceTimestamp = 0;
+struct AccountQuotaSnapshot {
+  DataAvailability availability = DataAvailability::Unknown;
+  // The upstream API reports consumption. The renderer derives remaining as
+  // 100 - weeklyUsedPercent; -1 means no trustworthy value is available.
+  int16_t weeklyUsedPercent = -1;
+  int64_t weeklyResetTimestamp = 0;
+  int64_t sourceGeneratedTimestamp = 0;
   uint32_t receivedAtMs = 0;
-  AgentSnapshot claude;
-  AgentSnapshot codex;
+  uint8_t sourceIndex = kNoAgentDevice;
+  bool stale = false;
+};
+
+struct AgentDeviceSnapshot {
+  char label[kDeviceLabelSize] = {};
+  char currentTask[kTaskTextSize] = {};
+  AgentReachability reachability = AgentReachability::Unconfigured;
+  WorkloadState workload = WorkloadState::Unknown;
+  // Counts use -1 for fields omitted by a compatible future/older agent.
+  int16_t activeWorkflows = -1;
+  int16_t activeWorkers = -1;
+  int16_t running = -1;
+  int16_t waitingApproval = -1;
+  int16_t waitingInput = -1;
+  int16_t errors = -1;
+  uint32_t activityAgeSecondsAtReceive = kUnknownActivityAgeSeconds;
+  uint32_t receivedAtMs = 0;
+  bool stale = false;
+  bool identityVerified = false;
+  bool stateExact = false;
+};
+
+struct AgentFleetSnapshot {
+  AccountQuotaSnapshot account;
+  AgentDeviceSnapshot devices[kAgentDeviceCount];
 };
 
 struct TelemetrySnapshot {
@@ -81,7 +225,7 @@ struct TelemetrySnapshot {
   float humidityPercent = NAN;
   uint16_t batteryMillivolts = 0;
   // Voltage-derived estimate only; -1 means unavailable. The board has no
-  // dedicated fuel-gauge IC, so the UI deliberately renders this with '~'.
+  // dedicated fuel-gauge IC, so any UI rendering must retain the '~' marker.
   int8_t batteryPercent = -1;
   uint32_t sampledAtMs = 0;
 };
@@ -109,8 +253,7 @@ struct NetworkQualitySnapshot {
 struct UiModel {
   NetworkSnapshot network;
   NetworkQualitySnapshot networkQuality;
-  BridgeEndpoint endpoint;
-  BridgeSnapshot bridge;
+  AgentFleetSnapshot fleet;
   TelemetrySnapshot telemetry;
   DisplayMode mode = DisplayMode::Auto;
   uint8_t page = 0;
@@ -118,29 +261,91 @@ struct UiModel {
   uint32_t lastDisplayAtMs = 0;
 };
 
-inline bool agentSemanticallyEqual(const AgentSnapshot& lhs,
-                                   const AgentSnapshot& rhs) {
-  return strcmp(lhs.status, rhs.status) == 0 &&
-         lhs.tokensToday == rhs.tokensToday &&
-         lhs.sessionMinutes == rhs.sessionMinutes &&
-         lhs.sessionWindowMinutes == rhs.sessionWindowMinutes &&
-         lhs.primaryPercent == rhs.primaryPercent &&
-         lhs.primaryWindowMinutes == rhs.primaryWindowMinutes &&
-         lhs.primaryResetTimestamp == rhs.primaryResetTimestamp &&
-         lhs.secondaryPercent == rhs.secondaryPercent &&
-         lhs.secondaryWindowMinutes == rhs.secondaryWindowMinutes &&
-         lhs.secondaryResetTimestamp == rhs.secondaryResetTimestamp &&
-         lhs.needsInput == rhs.needsInput;
+inline int16_t accountWeeklyRemainingPercent(
+    const AccountQuotaSnapshot& account) {
+  // Preserve the last valid value while the source is transiently stale. The
+  // adjacent data-status label makes that uncertainty explicit.
+  if (account.weeklyUsedPercent < 0) {
+    return -1;
+  }
+  if (account.weeklyUsedPercent >= 100) return 0;
+  return static_cast<int16_t>(100 - account.weeklyUsedPercent);
 }
 
-inline bool bridgeSemanticallyEqual(const BridgeSnapshot& lhs,
-                                    const BridgeSnapshot& rhs) {
-  return lhs.reachable == rhs.reachable &&
-         agentSemanticallyEqual(lhs.codex, rhs.codex);
+inline bool deviceOnline(const AgentDeviceSnapshot& device) {
+  return device.reachability == AgentReachability::Online &&
+         device.identityVerified && !device.stale;
 }
 
-inline bool bridgeIsUrgent(const BridgeSnapshot& snapshot) {
-  return snapshot.codex.needsInput || !snapshot.reachable;
+inline bool deviceNeedsAction(const AgentDeviceSnapshot& device) {
+  return device.workload == WorkloadState::WaitingApproval ||
+         device.workload == WorkloadState::WaitingInput ||
+         device.waitingApproval > 0 || device.waitingInput > 0;
+}
+
+inline bool deviceHasError(const AgentDeviceSnapshot& device) {
+  return device.workload == WorkloadState::Error || device.errors > 0 ||
+         device.reachability == AgentReachability::AuthError ||
+         device.reachability == AgentReachability::ProtocolError;
+}
+
+inline uint8_t fleetOnlineCount(const AgentFleetSnapshot& fleet) {
+  uint8_t count = 0;
+  for (size_t i = 0; i < kAgentDeviceCount; ++i) {
+    if (deviceOnline(fleet.devices[i])) ++count;
+  }
+  return count;
+}
+
+inline uint8_t fleetActionCount(const AgentFleetSnapshot& fleet) {
+  uint8_t count = 0;
+  for (size_t i = 0; i < kAgentDeviceCount; ++i) {
+    if (deviceNeedsAction(fleet.devices[i])) ++count;
+  }
+  return count;
+}
+
+inline uint8_t fleetErrorCount(const AgentFleetSnapshot& fleet) {
+  uint8_t count = 0;
+  for (size_t i = 0; i < kAgentDeviceCount; ++i) {
+    if (deviceHasError(fleet.devices[i])) ++count;
+  }
+  return count;
+}
+
+inline bool accountQuotaSemanticallyEqual(const AccountQuotaSnapshot& lhs,
+                                          const AccountQuotaSnapshot& rhs) {
+  return lhs.availability == rhs.availability &&
+         lhs.weeklyUsedPercent == rhs.weeklyUsedPercent &&
+         lhs.weeklyResetTimestamp == rhs.weeklyResetTimestamp &&
+         lhs.sourceIndex == rhs.sourceIndex && lhs.stale == rhs.stale;
+}
+
+inline bool agentDeviceSemanticallyEqual(const AgentDeviceSnapshot& lhs,
+                                         const AgentDeviceSnapshot& rhs) {
+  return strcmp(lhs.label, rhs.label) == 0 &&
+         strcmp(lhs.currentTask, rhs.currentTask) == 0 &&
+         lhs.reachability == rhs.reachability &&
+         lhs.workload == rhs.workload &&
+         lhs.activeWorkflows == rhs.activeWorkflows &&
+         lhs.activeWorkers == rhs.activeWorkers &&
+         lhs.running == rhs.running &&
+         lhs.waitingApproval == rhs.waitingApproval &&
+         lhs.waitingInput == rhs.waitingInput && lhs.errors == rhs.errors &&
+         lhs.stale == rhs.stale &&
+         lhs.identityVerified == rhs.identityVerified &&
+         lhs.stateExact == rhs.stateExact;
+}
+
+inline bool fleetSemanticallyEqual(const AgentFleetSnapshot& lhs,
+                                   const AgentFleetSnapshot& rhs) {
+  if (!accountQuotaSemanticallyEqual(lhs.account, rhs.account)) return false;
+  for (size_t i = 0; i < kAgentDeviceCount; ++i) {
+    if (!agentDeviceSemanticallyEqual(lhs.devices[i], rhs.devices[i])) {
+      return false;
+    }
+  }
+  return true;
 }
 
 }  // namespace app

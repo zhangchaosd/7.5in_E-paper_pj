@@ -1,5 +1,12 @@
 # P1 verification record
 
+> Historical record: this file documents device-verified `0.3.0-p1` behavior.
+> Current `0.4.0-p1` replaces the single unauthenticated Bridge and latency
+> Home page with the authenticated three-Agent account/fleet design. See
+> [`ARCHITECTURE.md`](ARCHITECTURE.md) and
+> [`../../docs/AGENT_PROTOCOL.md`](../../docs/AGENT_PROTOCOL.md). Do not rewrite
+> the results below as if they described the current firmware.
+
 ## Completed
 
 - Independent P1 project created; P0 diagnostic and both factory backups are

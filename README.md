@@ -1,14 +1,15 @@
 # 7.5 英寸墨水屏固件
 
-这是针对一块既有 ESP32 墨水屏设备重新开发的固件仓库。当前固件已在实机上验证：
+这是针对一块既有 ESP32 墨水屏设备重新开发的固件仓库。硬件、安全刷写路径和三设备 Codex Agent 看板已经过实机验证：
 
 - ESP32-WROOM-32E，8 MB Flash，无 PSRAM；
 - 7.5 英寸 800×480 黑白红墨水屏，排线 `P750057-MF1-A`；
-- 首页显示 Codex 5 小时/周额度余量、绝对重置时间、四站点 TCP/443 连接延迟；
-- 顶栏显示估算电量、Wi-Fi 和 Bridge 状态；
-- 三个用户按键、SHT30、Wi-Fi 配网、Bridge 轮询和设备 HTTP API 均已打通。
+- 首页左侧显示共享 Codex 账号的 Weekly 余量、绝对重置时间和数据来源；
+- 首页右侧显示三个 Codex Monitor Agent 的当前活动、计数和待操作状态；
+- 顶栏只显示 Wi-Fi 图标和动态 `N/3` 在线数，不显示电池或 Bridge；
+- 三个用户按键、SHT30、Wi-Fi 配网、Agent Bearer 认证轮询和设备 HTTP API 已集成。
 
-当前产品固件是 `0.3.0-p1`，源码位于 [`firmware/epaper75-app`](firmware/epaper75-app)。
+当前已验证固件是 `0.4.0-p1`，源码位于 [`firmware/epaper75-app`](firmware/epaper75-app)。
 [`firmware/epaper75-bringup`](firmware/epaper75-bringup) 是已验证的 P0 硬件诊断工程，只在硬件回归或恢复调查时使用。
 
 ## 快速开始
@@ -19,7 +20,8 @@
 2. [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md)：Windows/macOS 环境、依赖和构建；
 3. [`docs/FLASH_SAFETY.md`](docs/FLASH_SAFETY.md)：唯一允许的刷写范围；
 4. [`docs/HARDWARE.md`](docs/HARDWARE.md)：已确认硬件、引脚和按键；
-5. [`docs/BRIDGE_PROTOCOL.md`](docs/BRIDGE_PROTOCOL.md)：桌面 Bridge 的最小协议。
+5. [`docs/AGENT_PROTOCOL.md`](docs/AGENT_PROTOCOL.md)：三 Agent、Bearer 认证、schema 1.1 和设备配置契约。
+6. [`firmware/epaper75-app/P2_RESULTS.md`](firmware/epaper75-app/P2_RESULTS.md)：本版本脱敏后的构建、刷写和实机验证记录。
 
 macOS 初次安装依赖并构建：
 
@@ -46,7 +48,7 @@ cd firmware\epaper75-app
 
 两份实机 8 MB 完整备份必须继续离线保存在 `firmware/epaper75-bringup/backups/`。该目录被忽略，因为备份可能包含 Wi-Fi/NVS 私密数据；不要删除、重命名或上传它们。
 
-Bridge 参考实现来自外部项目，未复制到本仓库。固定版本和跨平台启动方式见 [`docs/BRIDGE_PROTOCOL.md`](docs/BRIDGE_PROTOCOL.md)。
+Codex Monitor Agent 程序和它的上游协议资料不复制到本仓库。固件只实现经审阅的最小消费端，见 [`docs/AGENT_PROTOCOL.md`](docs/AGENT_PROTOCOL.md)。旧版 Bridge 文档保留为迁移指针，`0.4.x` 固件不再消费其 `/status` 协议。
 
 ## 许可证
 
@@ -55,7 +57,8 @@ Bridge 参考实现来自外部项目，未复制到本仓库。固定版本和�
 ## 当前限制
 
 - 墨水屏仅启用约 21 秒的全屏刷新，未启用局刷；
-- 刷新期间主循环上的按键和 Bridge 轮询会暂停，HTTP API 与网络探测仍可用；
+- 刷新期间主循环上的按键扫描会暂停；Core 0 上的 HTTP API 和 Agent 轮询仍可运行；旧 NetworkProbe 在 `0.4.0-p1` 中不启动；
 - 电量是电压曲线估算值，界面以 `~` 标识，仍需万用表校准；
-- Bridge 和设备 HTTP API 当前无鉴权，只适合可信局域网；
+- Agent 请求使用共享 Bearer token；三个 endpoint 和 token 只能通过本地 USB 串口 `AGENTS` 命令写入，设备不提供网络配置接口；
+- 三个 Agent 中若有一台不在墨水屏可路由的网络，顶栏会如实显示小于 `3/3`，不会把配置数量当作在线数量；
 - EN 在刷新中断、电池续航、低压保护和高压轨 BUSY 故障仍待硬件验证。

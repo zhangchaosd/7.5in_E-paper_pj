@@ -5,16 +5,15 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
-#include "SettingsStore.h"
 #include "app/RuntimeState.h"
 
 namespace net {
 
 // WebServer is serviced exclusively by a task pinned to core 0. HTTP handlers
-// only update state or settings; they never invoke the e-paper driver.
+// expose read-only aggregate state and never invoke the e-paper driver.
 class DeviceServer {
  public:
-  DeviceServer(app::RuntimeState& state, SettingsStore& settings,
+  DeviceServer(app::RuntimeState& state,
                const char* firmwareVersion = "p1");
   ~DeviceServer();
 
@@ -32,16 +31,12 @@ class DeviceServer {
 
   void handleInfo();
   void handleHealth();
-  void handleBridge();
-  void handleDisplay();
-  void handleRefresh();
   void handleNotFound();
 
   void sendJson(int statusCode, const String& body);
   void sendError(int statusCode, const char* message);
 
   app::RuntimeState& state_;
-  SettingsStore& settings_;
   WebServer server_{80};
   TaskHandle_t taskHandle_ = nullptr;
   volatile bool stopRequested_ = false;

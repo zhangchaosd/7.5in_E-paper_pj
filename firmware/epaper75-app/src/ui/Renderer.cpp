@@ -16,11 +16,9 @@ constexpr uint16_t kBlack = GxEPD_BLACK;
 constexpr uint16_t kRed = GxEPD_RED;
 constexpr int16_t kStatusBottom = 62;
 constexpr int32_t kBeijingUtcOffsetSeconds = 8 * 60 * 60;
-
-constexpr const char* kLatencyLabels[app::kLatencyTargetCount] = {
-    "NETEASE MUSIC", "GITHUB", "GOOGLE", "YOUTUBE"};
-constexpr const char* kLatencyHosts[app::kLatencyTargetCount] = {
-    "music.163.com", "github.com", "google.com", "youtube.com"};
+constexpr int16_t kHomeDividerX = 340;
+constexpr int16_t kDeviceLeft = 364;
+constexpr int16_t kContentRight = 776;
 
 void text(Adafruit_GFX& canvas, int16_t x, int16_t y, uint8_t size,
           uint16_t color, const char* value) {
@@ -65,75 +63,141 @@ void drawWifiIcon(Adafruit_GFX& canvas, int16_t centerX, int16_t baselineY,
   canvas.fillCircle(centerX, baselineY, 3, color);
 }
 
-void drawBridgeIcon(Adafruit_GFX& canvas, int16_t centerX, int16_t centerY,
-                    uint16_t color) {
-  // Two offset capsule outlines form a simple chain-link symbol.
-  canvas.drawRoundRect(centerX - 19, centerY - 9, 24, 14, 7, color);
-  canvas.drawRoundRect(centerX - 18, centerY - 8, 22, 12, 6, color);
-  canvas.drawRoundRect(centerX - 4, centerY - 5, 24, 14, 7, color);
-  canvas.drawRoundRect(centerX - 3, centerY - 4, 22, 12, 6, color);
-  boldLine(canvas, centerX - 7, centerY + 3, centerX + 8, centerY - 3,
-           color);
-}
-
-void drawBatteryIcon(Adafruit_GFX& canvas, int16_t x, int16_t y,
-                     int8_t percent, uint16_t color) {
-  constexpr int16_t bodyWidth = 34;
-  constexpr int16_t bodyHeight = 18;
-  canvas.drawRect(x, y, bodyWidth, bodyHeight, color);
-  canvas.drawRect(x + 1, y + 1, bodyWidth - 2, bodyHeight - 2, color);
-  canvas.fillRect(x + bodyWidth, y + 5, 4, 8, color);
-  if (percent < 0) return;
-  const int16_t bounded = percent > 100 ? 100 : percent;
-  const int16_t fillWidth =
-      static_cast<int16_t>((static_cast<int32_t>(bodyWidth - 6) * bounded) /
-                           100);
-  if (fillWidth > 0) {
-    canvas.fillRect(x + 3, y + 3, fillWidth, bodyHeight - 6, color);
-  }
-}
-
-void uppercaseCopy(char* destination, size_t capacity, const char* source) {
+// Converts externally supplied UTF-8 into a bounded, printable ASCII label.
+// One '?' is emitted per non-ASCII code point so malformed or multilingual
+// task names cannot disturb the fixed 800x480 layout.
+void printableCopy(char* destination, size_t capacity, const char* source,
+                   size_t maxCharacters, bool uppercase = false) {
   if (capacity == 0) return;
   if (source == nullptr) source = "";
-  size_t i = 0;
-  for (; i + 1 < capacity && source[i] != '\0'; ++i) {
-    destination[i] = static_cast<char>(
-        toupper(static_cast<unsigned char>(source[i])));
+  if (maxCharacters + 1U > capacity) maxCharacters = capacity - 1U;
+
+  size_t output = 0;
+  bool truncated = false;
+  while (*source != '\0') {
+    if (output >= maxCharacters) {
+      truncated = true;
+      break;
+    }
+
+    const unsigned char value = static_cast<unsigned char>(*source++);
+    char printable = ' ';
+    if (value >= 0x20U && value <= 0x7eU) {
+      printable = static_cast<char>(value);
+    } else if (value >= 0x80U) {
+      printable = '?';
+      while ((static_cast<unsigned char>(*source) & 0xc0U) == 0x80U) {
+        ++source;
+      }
+    }
+    if (uppercase) {
+      printable = static_cast<char>(
+          toupper(static_cast<unsigned char>(printable)));
+    }
+    destination[output++] = printable;
   }
-  destination[i] = '\0';
+
+  if (truncated && maxCharacters >= 3U) {
+    destination[maxCharacters - 3U] = '.';
+    destination[maxCharacters - 2U] = '.';
+    destination[maxCharacters - 1U] = '.';
+    output = maxCharacters;
+  }
+  destination[output] = '\0';
 }
 
-bool sameIgnoreCase(const char* lhs, const char* rhs) {
-  return lhs != nullptr && rhs != nullptr && strcasecmp(lhs, rhs) == 0;
+const char* availabilityLabel(app::DataAvailability availability,
+                              bool stale) {
+  if (stale) return "STALE";
+  switch (availability) {
+    case app::DataAvailability::Available:
+      return "CURRENT";
+    case app::DataAvailability::Unavailable:
+      return "UNAVAILABLE";
+    case app::DataAvailability::Unknown:
+    default:
+      return "WAITING";
+  }
 }
 
-bool criticalStatus(const char* status) {
-  return sameIgnoreCase(status, "offline") ||
-         sameIgnoreCase(status, "critical") ||
-         sameIgnoreCase(status, "error") || sameIgnoreCase(status, "failed");
+bool availabilityAlert(app::DataAvailability availability, bool stale) {
+  return stale || availability == app::DataAvailability::Unavailable;
 }
 
-void formatTokens(char* output, size_t capacity, int32_t value) {
-  if (value < 0) {
-    snprintf(output, capacity, "--");
-  } else if (value >= 1000000) {
-    snprintf(output, capacity, "%.1fM", value / 1000000.0f);
-  } else if (value >= 1000) {
-    snprintf(output, capacity, "%.1fK", value / 1000.0f);
+const char* workloadLabel(const app::AgentDeviceSnapshot& device) {
+  switch (device.reachability) {
+    case app::AgentReachability::Offline:
+      return "OFFLINE";
+    case app::AgentReachability::AuthError:
+      return "AUTH ERROR";
+    case app::AgentReachability::ProtocolError:
+      return "BAD DATA";
+    case app::AgentReachability::Connecting:
+      return "CONNECTING";
+    case app::AgentReachability::Recovering:
+      return "RECOVERING";
+    case app::AgentReachability::Unconfigured:
+      return "NOT SET";
+    case app::AgentReachability::Online:
+      break;
+  }
+  if (device.stale) return "STALE";
+
+  switch (device.workload) {
+    case app::WorkloadState::Running:
+      return "RUNNING";
+    case app::WorkloadState::WaitingApproval:
+      return "APPROVAL";
+    case app::WorkloadState::WaitingInput:
+      return "INPUT";
+    case app::WorkloadState::Idle:
+      return "IDLE";
+    case app::WorkloadState::Error:
+      return "ERROR";
+    case app::WorkloadState::Unknown:
+    default:
+      return "UNKNOWN";
+  }
+}
+
+bool deviceAlert(const app::AgentDeviceSnapshot& device) {
+  return device.stale || app::deviceNeedsAction(device) ||
+         device.reachability == app::AgentReachability::Offline ||
+         device.reachability == app::AgentReachability::Unconfigured ||
+         device.reachability == app::AgentReachability::AuthError ||
+         device.reachability == app::AgentReachability::ProtocolError ||
+         device.workload == app::WorkloadState::Error || device.errors > 0;
+}
+
+void formatActivityAge(char* output, size_t capacity,
+                       const app::AgentDeviceSnapshot& device) {
+  if (device.receivedAtMs == 0U ||
+      device.reachability == app::AgentReachability::Unconfigured ||
+      device.activityAgeSecondsAtReceive ==
+          app::kUnknownActivityAgeSeconds) {
+    snprintf(output, capacity, "NO DATA");
+    return;
+  }
+  const uint32_t age = device.activityAgeSecondsAtReceive;
+  if (age < 15U) {
+    snprintf(output, capacity, "LIVE");
+  } else if (age < 60U) {
+    snprintf(output, capacity, "UPDATED %lus",
+             static_cast<unsigned long>(age));
+  } else if (age < 3600U) {
+    snprintf(output, capacity, "UPDATED %lum",
+             static_cast<unsigned long>(age / 60U));
+  } else if (age < 86400U) {
+    snprintf(output, capacity, "UPDATED %luh",
+             static_cast<unsigned long>(age / 3600U));
   } else {
-    snprintf(output, capacity, "%ld", static_cast<long>(value));
+    snprintf(output, capacity, "UPDATED %lud",
+             static_cast<unsigned long>(age / 86400U));
   }
-}
-
-int16_t remainingPercent(int16_t usedPercent) {
-  if (usedPercent < 0) return -1;
-  if (usedPercent > 100) usedPercent = 100;
-  return static_cast<int16_t>(100 - usedPercent);
 }
 
 void formatResetAt(char* output, size_t capacity, int64_t resetTimestamp) {
-  // The Bridge contract is minute-precision, so the screen omits seconds.
+  // The Agent rate-limit contract is minute-precision on screen.
   if (resetTimestamp < 946684800LL) {
     snprintf(output, capacity, "--");
     return;
@@ -166,162 +230,166 @@ void Renderer::render(Adafruit_GFX& canvas, const app::UiModel& model) const {
 
 void Renderer::drawStatusBar(Adafruit_GFX& canvas,
                              const app::UiModel& model) const {
-  char line[24];
+  char line[12];
 
   canvas.fillRect(24, 14, 6, 32, kRed);
-  text(canvas, 42, 12, 3, kBlack,
-       (model.page % 2U) == 0U ? "CODEX MONITOR" : "SYSTEM & CONFIG");
+  text(canvas, 42, 12, 3, kBlack, "CODEX FLEET");
 
-  const bool batteryCritical = model.telemetry.batteryPercent >= 0 &&
-                               model.telemetry.batteryPercent <= 10;
-  const uint16_t batteryColor = alertColor(batteryCritical);
-  drawBatteryIcon(canvas, 512, 22, model.telemetry.batteryPercent,
-                  batteryColor);
-  if (model.telemetry.batteryPercent >= 0) {
-    snprintf(line, sizeof(line), "~%d%%", model.telemetry.batteryPercent);
-  } else {
-    snprintf(line, sizeof(line), "--%%");
-  }
-  text(canvas, 558, 18, 2, batteryColor, line);
-
-  drawWifiIcon(canvas, 667, 38,
+  drawWifiIcon(canvas, 698, 38,
                alertColor(!model.network.connected));
-  drawBridgeIcon(canvas, 748, 29,
-                 alertColor(!model.bridge.reachable));
+  const uint8_t online = app::fleetOnlineCount(model.fleet);
+  snprintf(line, sizeof(line), "%u/%u", online,
+           static_cast<unsigned>(app::kAgentDeviceCount));
+  rightText(canvas, kContentRight, 18, 2,
+            alertColor(online < app::kAgentDeviceCount), line);
 
   canvas.drawFastHLine(20, kStatusBottom, 760, kBlack);
 }
 
 void Renderer::drawDashboard(Adafruit_GFX& canvas,
                              const app::UiModel& model) const {
-  canvas.drawFastVLine(400, 84, 355, kBlack);
-  drawCodexUsage(canvas, model);
+  canvas.drawFastVLine(kHomeDividerX, 84, 356, kBlack);
+  drawAccountQuota(canvas, model);
 
-  text(canvas, 424, 82, 2, kBlack, "NETWORK");
-  rightText(canvas, 776, 90, 1, kBlack, "TCP/443");
-  text(canvas, 424, 126, 1, kBlack, "SERVICE");
-  rightText(canvas, 776, 126, 1, kBlack, "LATENCY");
-  canvas.drawFastHLine(424, 148, 352, kBlack);
-  canvas.drawFastHLine(424, 149, 352, kBlack);
-  for (size_t i = 0; i < app::kLatencyTargetCount; ++i) {
-    drawLatencyRow(canvas, model.networkQuality.targets[i], i, 424,
-                   static_cast<int16_t>(158 + i * 68), 352);
-  }
+  char summary[36];
+  snprintf(summary, sizeof(summary), "%u ONLINE / %u ACTION",
+           app::fleetOnlineCount(model.fleet),
+           app::fleetActionCount(model.fleet));
+  text(canvas, kDeviceLeft, 82, 2, kBlack, "DEVICES");
+  rightText(canvas, kContentRight, 88, 1,
+            alertColor(app::fleetActionCount(model.fleet) > 0), summary);
+  boldLine(canvas, kDeviceLeft, 112, kContentRight, 112, kBlack);
+
+  drawDeviceRow(canvas, model, 0, 124);
+  drawDeviceRow(canvas, model, 1, 225);
+  drawDeviceRow(canvas, model, 2, 326);
 }
 
-void Renderer::drawCodexUsage(Adafruit_GFX& canvas,
-                              const app::UiModel& model) const {
+void Renderer::drawAccountQuota(Adafruit_GFX& canvas,
+                                const app::UiModel& model) const {
   constexpr int16_t x = 24;
-  constexpr int16_t width = 352;
-  const app::AgentSnapshot& codex = model.bridge.codex;
-  const int16_t fiveHourRemaining = remainingPercent(codex.primaryPercent);
-  const int16_t weeklyRemaining = remainingPercent(codex.secondaryPercent);
-  const bool statusCritical = !model.bridge.reachable || codex.needsInput ||
-                              criticalStatus(codex.status);
+  constexpr int16_t width = 292;
+  const app::AccountQuotaSnapshot& account = model.fleet.account;
+  const int16_t weeklyRemaining =
+      app::accountWeeklyRemainingPercent(account);
+  const bool lowQuota = weeklyRemaining >= 0 && weeklyRemaining <= 15;
+  const bool dataAlert = availabilityAlert(account.availability, account.stale);
 
-  char line[96];
-  char status[app::kStatusTextSize];
-  char value[32];
+  char line[48];
   char resetAt[32];
+  char source[24];
 
-  text(canvas, x, 82, 2, kBlack, "QUOTA");
-  const char* statusText = codex.status;
-  if (!model.bridge.reachable) {
-    statusText = "BRIDGE OFFLINE";
-  } else if (codex.needsInput) {
-    statusText = "NEEDS INPUT";
-  } else if (criticalStatus(codex.status)) {
-    statusText = "CODEX ERROR";
-  }
-  uppercaseCopy(status, sizeof(status), statusText);
-  int16_t statusX = 0;
-  int16_t statusY = 0;
-  uint16_t statusWidth = 0;
-  uint16_t statusHeight = 0;
-  canvas.setTextSize(2);
-  canvas.getTextBounds(status, 0, 0, &statusX, &statusY, &statusWidth,
-                       &statusHeight);
-  const int16_t statusLeft =
-      static_cast<int16_t>(x + width - statusWidth - statusX);
-  canvas.fillCircle(statusLeft - 12, 92, 4,
-                    alertColor(statusCritical));
-  text(canvas, statusLeft, 83, 2, alertColor(statusCritical), status);
-
-  formatTokens(value, sizeof(value), codex.tokensToday);
-  text(canvas, x, 123, 1, kBlack, "TODAY");
-  snprintf(line, sizeof(line), "%s TOKENS", value);
-  text(canvas, x + 64, 117, 2, kBlack, line);
-  canvas.drawFastHLine(x, 151, width, kBlack);
-
-  text(canvas, x, 169, 2, kBlack, "5-HOUR REMAINING");
-  if (fiveHourRemaining >= 0)
-    snprintf(line, sizeof(line), "%d%%", fiveHourRemaining);
-  else
-    snprintf(line, sizeof(line), "--%%");
-  rightText(canvas, x + width, 154, 5,
-            alertColor(fiveHourRemaining >= 0 && fiveHourRemaining <= 15),
-            line);
-  drawProgress(canvas, x, 215, width, fiveHourRemaining,
-               fiveHourRemaining >= 0 && fiveHourRemaining <= 15);
-  formatResetAt(resetAt, sizeof(resetAt), codex.primaryResetTimestamp);
-  text(canvas, x, 244, 1, kBlack, "RESET");
-  text(canvas, x + 58, 238, 2, kBlack, resetAt);
-  text(canvas, x + 271, 244, 1, kBlack, "UTC+8");
-  canvas.drawFastHLine(x, 276, width, kBlack);
-
-  text(canvas, x, 294, 2, kBlack, "WEEKLY REMAINING");
+  text(canvas, x, 82, 2, kBlack, "ACCOUNT");
+  rightText(canvas, x + width, 88, 1, kBlack, "SHARED CODEX");
+  text(canvas, x, 124, 2, kBlack, "WEEKLY REMAINING");
   if (weeklyRemaining >= 0)
     snprintf(line, sizeof(line), "%d%%", weeklyRemaining);
   else
     snprintf(line, sizeof(line), "--%%");
-  rightText(canvas, x + width, 279, 5,
-            alertColor(weeklyRemaining >= 0 && weeklyRemaining <= 15), line);
-  drawProgress(canvas, x, 340, width, weeklyRemaining,
-               weeklyRemaining >= 0 && weeklyRemaining <= 15);
-  formatResetAt(resetAt, sizeof(resetAt), codex.secondaryResetTimestamp);
-  text(canvas, x, 369, 1, kBlack, "RESET");
-  text(canvas, x + 58, 363, 2, kBlack, resetAt);
-  text(canvas, x + 271, 369, 1, kBlack, "UTC+8");
+  text(canvas, x, 154, 6, alertColor(lowQuota), line);
+  drawProgress(canvas, x, 215, width, weeklyRemaining, lowQuota);
+
+  text(canvas, x, 255, 1, kBlack, "RESET AT");
+  formatResetAt(resetAt, sizeof(resetAt), account.weeklyResetTimestamp);
+  text(canvas, x, 274, 2, kBlack, resetAt);
+  rightText(canvas, x + width, 306, 1, kBlack, "UTC+8");
+  canvas.drawFastHLine(x, 330, width, kBlack);
+
+  text(canvas, x, 350, 1, kBlack, "PRIMARY SOURCE");
+  if (account.sourceIndex < app::kAgentDeviceCount) {
+    printableCopy(source, sizeof(source),
+                  model.fleet.devices[account.sourceIndex].label, 18, true);
+  } else {
+    snprintf(source, sizeof(source), "--");
+  }
+  rightText(canvas, x + width, 345, 2, kBlack, source);
+
+  text(canvas, x, 385, 1, kBlack, "ACCOUNT DATA");
+  const char* availability =
+      availabilityLabel(account.availability, account.stale);
+  rightText(canvas, x + width, 380, 2, alertColor(dataAlert), availability);
+
+  text(canvas, x, 420, 1, kBlack, "UPDATED");
+  if (account.sourceGeneratedTimestamp > 0) {
+    formatResetAt(resetAt, sizeof(resetAt),
+                  account.sourceGeneratedTimestamp);
+    rightText(canvas, x + width, 420, 1, alertColor(account.stale),
+              resetAt + 11);
+  } else {
+    rightText(canvas, x + width, 420, 1, alertColor(account.stale), "--");
+  }
 }
 
-void Renderer::drawLatencyRow(Adafruit_GFX& canvas,
-                              const app::LatencyTargetSnapshot& target,
-                              size_t targetIndex, int16_t x, int16_t y,
-                              int16_t width) const {
-  char latency[24];
-  const char* quality = "MEASURING";
-  bool alert = false;
+void Renderer::drawDeviceRow(Adafruit_GFX& canvas,
+                             const app::UiModel& model, size_t deviceIndex,
+                             int16_t y) const {
+  if (deviceIndex >= app::kAgentDeviceCount) return;
+  const app::AgentDeviceSnapshot& device = model.fleet.devices[deviceIndex];
+  const bool alert = deviceAlert(device);
+  const bool primary = model.fleet.account.sourceIndex == deviceIndex;
 
-  if (target.sampledAtMs == 0) {
-    snprintf(latency, sizeof(latency), "-- ms");
-  } else if (!target.reachable || target.latencyMs < 0) {
-    snprintf(latency, sizeof(latency), "OFFLINE");
-    quality = "NO TCP CONNECTION";
-    alert = true;
+  char label[24];
+  char task[36];
+  char counts[52];
+  char age[24];
+  printableCopy(label, sizeof(label), device.label, 18, true);
+  printableCopy(task, sizeof(task), device.currentTask, 32);
+  if (label[0] == '\0') snprintf(label, sizeof(label), "DEVICE %u",
+                                 static_cast<unsigned>(deviceIndex + 1U));
+  if (task[0] == '\0') snprintf(task, sizeof(task), "No active task");
+
+  if (alert) canvas.fillRect(kDeviceLeft, y, 5, 76, kRed);
+  const int16_t contentLeft = static_cast<int16_t>(kDeviceLeft +
+                                                   (alert ? 16 : 0));
+  text(canvas, contentLeft, y, 2, kBlack, label);
+  if (primary) text(canvas, contentLeft + 136, y + 6, 1, kBlack, "PRIMARY");
+
+  const char* state = workloadLabel(device);
+  rightText(canvas, kContentRight, y, 2, alertColor(alert), state);
+  text(canvas, contentLeft, y + 31, 2, kBlack, task);
+
+  const int16_t waiting =
+      device.waitingApproval >= 0 && device.waitingInput >= 0
+          ? static_cast<int16_t>(device.waitingApproval +
+                                 device.waitingInput)
+          : -1;
+  char workflows[8];
+  char workers[8];
+  if (device.activeWorkflows >= 0) {
+    snprintf(workflows, sizeof(workflows), "%d", device.activeWorkflows);
   } else {
-    snprintf(latency, sizeof(latency), "%ld ms",
-             static_cast<long>(target.latencyMs));
-    if (target.latencyMs <= 100) {
-      quality = "GOOD";
-    } else if (target.latencyMs <= 300) {
-      quality = "OK";
-    } else if (target.latencyMs <= 700) {
-      quality = "SLOW";
-      alert = true;
-    } else {
-      quality = "VERY SLOW";
-      alert = true;
-    }
+    snprintf(workflows, sizeof(workflows), "--");
+  }
+  if (device.activeWorkers >= 0) {
+    snprintf(workers, sizeof(workers), "%d", device.activeWorkers);
+  } else {
+    snprintf(workers, sizeof(workers), "--");
+  }
+  if (waiting > 0) {
+    snprintf(counts, sizeof(counts), "%s FLOW / %s WORKERS / %d WAITING",
+             workflows, workers, waiting);
+  } else if (device.errors > 0) {
+    snprintf(counts, sizeof(counts), "%s FLOW / %s WORKERS / %d ERROR",
+             workflows, workers, device.errors);
+  } else if (device.running >= 0) {
+    snprintf(counts, sizeof(counts), "%s FLOW / %s WORKERS / %d RUN",
+             workflows, workers, device.running);
+  } else {
+    snprintf(counts, sizeof(counts), "%s FLOW / %s WORKERS",
+             workflows, workers);
+  }
+  text(canvas, contentLeft, y + 59, 1, kBlack, counts);
+  if (app::deviceNeedsAction(device)) {
+    rightText(canvas, kContentRight, y + 59, 1, kRed, "ACTION NEEDED");
+  } else {
+    formatActivityAge(age, sizeof(age), device);
+    rightText(canvas, kContentRight, y + 59, 1,
+              alertColor(device.stale), age);
   }
 
-  const size_t boundedIndex =
-      targetIndex < app::kLatencyTargetCount ? targetIndex : 0;
-  text(canvas, x, y, 2, kBlack, kLatencyLabels[boundedIndex]);
-  rightText(canvas, x + width, y - 2, 3, alertColor(alert), latency);
-  text(canvas, x, y + 28, 1, kBlack, kLatencyHosts[boundedIndex]);
-  rightText(canvas, x + width, y + 30, 1, alertColor(alert), quality);
-  if (boundedIndex + 1U < app::kLatencyTargetCount) {
-    canvas.drawFastHLine(x, y + 58, width, kBlack);
+  if (deviceIndex + 1U < app::kAgentDeviceCount) {
+    canvas.drawFastHLine(kDeviceLeft, y + 89,
+                         kContentRight - kDeviceLeft, kBlack);
   }
 }
 
@@ -344,33 +412,61 @@ void Renderer::drawProgress(Adafruit_GFX& canvas, int16_t x, int16_t y,
 void Renderer::drawSystemPage(Adafruit_GFX& canvas,
                               const app::UiModel& model) const {
   char line[128];
+  char source[24];
   constexpr int16_t left = 24;
   constexpr int16_t right = 410;
 
-  text(canvas, left, 77, 2, kBlack, "NETWORK");
+  text(canvas, left, 77, 2, kBlack, "CONNECTIVITY");
   canvas.drawFastHLine(left, 100, 350, kBlack);
   snprintf(line, sizeof(line), "WIFI      %s",
            model.network.connected ? "ONLINE" : "OFFLINE");
   text(canvas, left, 113, 2, alertColor(!model.network.connected), line);
-  snprintf(line, sizeof(line), "SSID      %.18s",
-           model.network.ssid[0] ? model.network.ssid : "--");
+  if (model.network.connected) {
+    snprintf(line, sizeof(line), "SIGNAL    %d DBM", model.network.rssi);
+  } else {
+    snprintf(line, sizeof(line), "SIGNAL    -- DBM");
+  }
   text(canvas, left, 140, 2, kBlack, line);
-  snprintf(line, sizeof(line), "IP        %s", model.network.ip);
-  text(canvas, left, 167, 2, kBlack, line);
-  snprintf(line, sizeof(line), "RSSI      %d DBM", model.network.rssi);
-  text(canvas, left, 194, 2, kBlack, line);
+  const uint8_t online = app::fleetOnlineCount(model.fleet);
+  snprintf(line, sizeof(line), "AGENTS    %u/%u ONLINE", online,
+           static_cast<unsigned>(app::kAgentDeviceCount));
+  text(canvas, left, 167, 2,
+       alertColor(online < app::kAgentDeviceCount), line);
+  const uint8_t actions = app::fleetActionCount(model.fleet);
+  snprintf(line, sizeof(line), "ACTIONS   %u", actions);
+  text(canvas, left, 194, 2, alertColor(actions > 0), line);
 
-  text(canvas, left, 254, 2, kBlack, "BRIDGE");
+  text(canvas, left, 254, 2, kBlack, "FLEET DATA");
   canvas.drawFastHLine(left, 277, 350, kBlack);
-  snprintf(line, sizeof(line), "STATE     %s",
-           model.bridge.reachable ? "ONLINE" : "OFFLINE");
-  text(canvas, left, 290, 2, alertColor(!model.bridge.reachable), line);
-  snprintf(line, sizeof(line), "HOST      %.18s",
-           model.endpoint.configured() ? model.endpoint.host : "NOT SET");
-  text(canvas, left, 317, 2,
-       alertColor(!model.endpoint.configured()), line);
-  snprintf(line, sizeof(line), "PORT      %u", model.endpoint.port);
-  text(canvas, left, 344, 2, kBlack, line);
+  const bool accountAlert = availabilityAlert(
+      model.fleet.account.availability, model.fleet.account.stale);
+  snprintf(line, sizeof(line), "ACCOUNT   %s",
+           availabilityLabel(model.fleet.account.availability,
+                             model.fleet.account.stale));
+  text(canvas, left, 290, 2, alertColor(accountAlert), line);
+  if (model.fleet.account.sourceIndex < app::kAgentDeviceCount) {
+    printableCopy(source, sizeof(source),
+                  model.fleet.devices[model.fleet.account.sourceIndex].label,
+                  18, true);
+  } else {
+    snprintf(source, sizeof(source), "--");
+  }
+  snprintf(line, sizeof(line), "SOURCE    %s", source);
+  text(canvas, left, 317, 2, kBlack, line);
+
+  uint8_t verified = 0;
+  uint8_t exact = 0;
+  for (size_t i = 0; i < app::kAgentDeviceCount; ++i) {
+    if (model.fleet.devices[i].identityVerified) ++verified;
+    if (model.fleet.devices[i].stateExact) ++exact;
+  }
+  snprintf(line, sizeof(line), "IDENTITY  %u/%u VERIFIED", verified,
+           static_cast<unsigned>(app::kAgentDeviceCount));
+  text(canvas, left, 344, 2,
+       alertColor(verified < app::kAgentDeviceCount), line);
+  snprintf(line, sizeof(line), "STATE     %u/%u EXACT", exact,
+           static_cast<unsigned>(app::kAgentDeviceCount));
+  text(canvas, left, 371, 2, kBlack, line);
 
   text(canvas, right, 77, 2, kBlack, "DEVICE");
   canvas.drawFastHLine(right, 100, 366, kBlack);
@@ -378,8 +474,8 @@ void Renderer::drawSystemPage(Adafruit_GFX& canvas,
   text(canvas, right, 113, 2, kBlack, line);
   text(canvas, right, 140, 2, kBlack, "MCU       ESP32-WROOM-32E");
   text(canvas, right, 167, 2, kBlack, "PANEL     800x480 B/W/RED");
-  text(canvas, right, 194, 2, kBlack, "SETUP AP  Epaper75-Setup");
-  text(canvas, right, 221, 1, kBlack, "REFRESH   FULL / EVENT DRIVEN");
+  text(canvas, right, 194, 2, kBlack, "FLASH     8 MB / NO PSRAM");
+  text(canvas, right, 221, 1, kBlack, "DISPLAY   FULL / EVENT DRIVEN");
 
   text(canvas, right, 254, 2, kBlack, "SENSORS & BATTERY");
   canvas.drawFastHLine(right, 277, 366, kBlack);

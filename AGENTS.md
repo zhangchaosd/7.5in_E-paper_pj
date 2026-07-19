@@ -10,7 +10,9 @@ The product target is a recovered 7.5-inch tri-color e-paper device. The canonic
 firmware/epaper75-app
 ```
 
-Current verified version: `0.3.0-p1`.
+Current verified version: `0.4.0-p1`. Its sanitized device-verification record
+is `firmware/epaper75-app/P2_RESULTS.md`. `P1_RESULTS.md` is historical for
+`0.3.0-p1`; do not treat it as the current Home page or Agent protocol.
 
 `firmware/epaper75-bringup` is the P0 diagnostic/reference project. Keep it available for hardware regression work, but do not merge P0 display routines into the product firmware without review.
 
@@ -20,8 +22,9 @@ Start with:
 - `docs/HARDWARE.md`
 - `docs/DEVELOPMENT.md`
 - `docs/FLASH_SAFETY.md`
-- `docs/BRIDGE_PROTOCOL.md`
+- `docs/AGENT_PROTOCOL.md`
 - `firmware/epaper75-app/ARCHITECTURE.md`
+- `firmware/epaper75-app/P2_RESULTS.md`
 - `firmware/epaper75-app/P1_RESULTS.md`
 
 ## Non-negotiable hardware and flash safety
@@ -34,7 +37,7 @@ Start with:
 6. Before every physical flash, confirm serial `INFO` reports `panel=powered_off` and no panel error.
 7. Flashing requires two independently verified local 8 MB factory backups in `firmware/epaper75-bringup/backups/`. They are private, ignored by Git, and must never be uploaded or deleted.
 8. Use only `tools/flash_app0_only.ps1` on Windows or `tools/flash_app0_only.sh` on macOS/Linux. Read `docs/FLASH_SAFETY.md` first.
-9. Do not expose device IP, MAC, SSID, Bridge host, serial-port identity, auth files, tokens, or full serial `INFO` output in commits, issues, logs, or responses.
+9. Do not expose device IP, MAC, SSID, Agent host, serial-port identity, auth files, Bearer tokens, Agent installation IDs, or full serial `INFO` output in commits, issues, logs, or responses.
 
 If a proposed change weakens any of these constraints, stop and ask the owner.
 
@@ -62,30 +65,34 @@ Final physical order on the right edge, top to bottom: USB-C, power switch, EN/r
 
 ## Product behavior that must be preserved
 
-- Home page: Codex only on the left, network latency on the right.
-- Quota bars show remaining capacity: `100 - used_percent`; they start full after reset and drain with use.
+- Home page left: the shared Codex account's Weekly remaining quota, absolute reset time, selected source Agent, availability, and update time.
+- Home page right: exactly three configured Agent devices, each with reachability, workload/activity, bounded task text, counts, and whether user action is required.
+- The account quota source is Agent slot 0 first; another verified Agent may supply fallback account data because all three installations use the same Codex account. Slot 0 is fixed as primary.
+- The Weekly bar shows remaining capacity: `100 - used_percent`; it starts full after reset and drains with use.
 - Reset time is an absolute `YYYY-MM-DD HH:MM` time in UTC+8, not a countdown.
-- Network values are DNS + TCP connection time to port 443, not ICMP ping, TLS, or page-load time.
-- Targets: NetEase Cloud Music, GitHub, Google, and YouTube.
 - Temperature and humidity belong on the System page, not Home.
 - Battery percentage is voltage-derived and must remain visibly approximate (`~`).
 - Home has no button legend, IP/subtitle row, or bottom help copy.
-- Header contains title, battery, Wi-Fi icon, and Bridge icon.
-- Red is reserved for the title accent, low quota, and error/offline/slow states.
+- Header contains the title, Wi-Fi icon, and a live `N/3` Agent count only. It must not show battery or a Bridge icon.
+- Red is reserved for the title accent, low quota, and action/error/offline states.
 - Short buttons: Upper next page, Middle refresh, Lower back.
-- Long buttons: Upper immediate Bridge poll, Middle System page, Lower Home.
+- Long buttons: Upper immediate Agent poll, Middle System page, Lower Home.
 - Use event-driven full refresh with the existing 30/60 second floors. Do not introduce periodic high-rate refresh or partial refresh without panel-specific proof.
 
 ## Architecture map
 
 ```text
 board/  GPIO startup, buttons, SHT30, battery sampling
-net/    Wi-Fi provisioning, settings, Bridge client, HTTP API, latency probe
+net/    Wi-Fi provisioning, private Agent settings/client, HTTP API
 app/    fixed-size shared state and refresh policy
 ui/     rendering and the only physical panel-refresh entry point
 ```
 
-The HTTP task and network-probe task run on Core 0. Button scanning, Bridge polling, and the display state machine run from the Arduino main loop on Core 1. HTTP handlers only mutate cached state or queue refreshes; they must never call the display directly.
+The HTTP task and Agent polling task run on Core 0. Button scanning and the
+display state machine run from the Arduino main loop on Core 1. The legacy
+`NetworkProbe` implementation is not started in `0.4.0-p1`. HTTP handlers only
+mutate cached state or queue refreshes; they must never call the display
+directly.
 
 All display traffic must continue through `ui::EpdController`. The bounded recovery, RTC journal, one-retry rule, power-off step, and `FaultLocked` behavior are safety mechanisms, not optional abstractions.
 
@@ -136,13 +143,42 @@ For source or build-script changes:
 - review that no command writes outside `0x10000`;
 - check static RAM/flash usage for regressions.
 
-For hardware-visible changes, also perform a proportionate smoke test: serial boot with no panic, Wi-Fi/Bridge health, button mapping, one physical refresh, and final `panel=powered_off`. Never publish raw network identifiers from that test.
+For hardware-visible changes, also perform a proportionate smoke test: serial boot with no panic, Wi-Fi/Agent health, button mapping, one physical refresh, and final `panel=powered_off`. Never publish raw network identifiers from that test.
 
-## Bridge boundary
+## Agent boundary
 
-The firmware polls `GET /status` every five seconds. The JSON must include both `claude` and `codex` objects even though Home renders only Codex. The exact schema and external cross-platform reference implementation are documented in `docs/BRIDGE_PROTOCOL.md`.
+The firmware consumes Codex Monitor Agent `0.4.x` schema `1.1` over HTTP. Every
+JSON request uses `Authorization: Bearer <token>`. It verifies schema major 1
+and a stable `installation_id` through `GET /api/v1/version`, then polls one of
+three slots every five seconds with `GET /api/v1/status`; each Agent is visited
+about every 15 seconds. It requests `GET /api/v1/threads?limit=12` only when
+needed for current activity and polls account-level `GET /api/v1/rate-limits`
+on a 60-second cadence, fixed slot 0 first with verified fallback.
 
-Do not vendor or casually edit the external sample project in this repository. For a future native Bridge, implement the documented protocol in a new, clearly owned `bridge/` subtree and add pairing/authentication before widening deployment beyond a trusted LAN.
+An HTTP 401 locks that Agent until configuration changes. The first authenticated
+identity is pinned in private NVS; an incompatible schema or later changed
+installation identity is a protocol error and remains locked until configuration
+changes. Ordinary transport failures move through
+recovery and become offline after three consecutive failures. Do not collapse
+unknown, stale, unavailable, idle, offline, auth error, and protocol error into
+one state.
+
+Three endpoints and one shared Bearer token are persisted in the project-owned
+NVS blob only through the physical USB serial command
+`AGENTS <endpoint0> <endpoint1> <endpoint2> <token>`. Slot 0 is always primary.
+There is no network configuration endpoint; never reintroduce
+`POST /api/agents` without owner review and an authenticated design. Agent
+hosts, token, and installation IDs must stay in `SettingsStore`/`AgentClient`;
+they must never enter `UiModel`, HTTP responses, renderer output, serial output,
+or Git. The raw `AGENTS` input line is secret and must not be captured in logs
+or responses. The complete consumed-field and provisioning contract is
+documented in `docs/AGENT_PROTOCOL.md`. `docs/BRIDGE_PROTOCOL.md` is only a
+compatibility pointer for the retired `0.3.x` Bridge path.
+
+Do not vendor the external Agent program or the user's local Agent contract
+copies into this repository. Private Agent settings may be changed only over a
+locally controlled USB serial session. Never add them to Wi-Fi provisioning or
+the device HTTP API.
 
 ## Repository hygiene
 
@@ -157,7 +193,7 @@ For renderer changes, make and inspect an 800x480 preview before building or fla
 
 ## Current open hardware work
 
-- Visually accept the latest `0.3.0-p1` flat layout on the physical panel.
+- Visually accept the `0.4.0-p1` account/fleet layout on the physical panel.
 - Test EN/reset during an active refresh and confirm bounded recovery without a refresh loop.
 - Calibrate battery voltage/percentage against a multimeter.
 - Compare SHT30 readings after USB/charger heat settles.

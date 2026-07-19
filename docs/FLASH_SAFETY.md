@@ -53,12 +53,14 @@ macOS/Linux 必须使用：
 1. 串口无 boot loop、panic 或 brownout；
 2. 固件版本符合预期；
 3. Wi-Fi/NVS 配置仍保留；
-4. Bridge 和 `/api/health` 正常；
+4. `/api/health` 的 Wi-Fi/Agent 安全聚合状态正常，且没有泄露 endpoint、token 或安装 ID；
 5. 三个按键映射不变；
 6. 只做一次必要的物理全刷，确认约 21 秒内完成；
 7. 最终再次确认 `panel=powered_off` 和无显示错误。
 
-不要在公开日志中粘贴完整 `INFO`，因为它包含网络地址和 Bridge 端点。
+不要在公开日志中粘贴完整 `INFO`、原始 HTTP 响应或串口 `AGENTS` 配置命令；它们可能
+包含网络地址、Agent 端点、Bearer token、安装 ID 或串口标识。只报告经过
+脱敏的布尔结果和聚合计数。
 
 ## 回退原则
 

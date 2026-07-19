@@ -74,13 +74,6 @@ UiModel RuntimeState::snapshot() const {
   return copy;
 }
 
-BridgeEndpoint RuntimeState::bridgeEndpoint() const {
-  portENTER_CRITICAL(&mux_);
-  const BridgeEndpoint copy = model_.endpoint;
-  portEXIT_CRITICAL(&mux_);
-  return copy;
-}
-
 void RuntimeState::bumpRevisionLocked() {
   ++model_.revision;
   if (model_.revision == 0) model_.revision = 1;
@@ -99,8 +92,10 @@ bool RuntimeState::updateNetwork(const NetworkSnapshot& value) {
 
 bool RuntimeState::updateNetworkQuality(const NetworkQualitySnapshot& value) {
   portENTER_CRITICAL(&mux_);
-  const bool changed =
-      !networkQualityEqual(model_.networkQuality, value);
+  // Network quality lives on the System page. Cache new readings on Home
+  // without spending a full panel refresh on information that is not visible.
+  const bool changed = (model_.page % 2U) != 0U &&
+                       !networkQualityEqual(model_.networkQuality, value);
   model_.networkQuality = value;
   if (changed) bumpRevisionLocked();
   portEXIT_CRITICAL(&mux_);
@@ -109,32 +104,21 @@ bool RuntimeState::updateNetworkQuality(const NetworkQualitySnapshot& value) {
 
 bool RuntimeState::updateTelemetry(const TelemetrySnapshot& value) {
   portENTER_CRITICAL(&mux_);
-  // Temperature and humidity are intentionally absent from page 0. Do not
-  // wear the panel for hidden sensor-only changes; switching to page 1 bumps
-  // the revision and renders the newest cached values there.
-  const bool changed = (model_.page % 2U) == 0U
-                           ? !batteryTelemetryEqual(model_.telemetry, value)
-                           : !telemetryEqual(model_.telemetry, value);
+  // All telemetry is intentionally absent from Home. Cache it there without
+  // wearing the panel; switching to System bumps the revision and renders the
+  // newest values.
+  const bool changed = (model_.page % 2U) != 0U &&
+                       !telemetryEqual(model_.telemetry, value);
   model_.telemetry = value;
   if (changed) bumpRevisionLocked();
   portEXIT_CRITICAL(&mux_);
   return changed;
 }
 
-bool RuntimeState::updateBridge(const BridgeSnapshot& value) {
+bool RuntimeState::updateFleet(const AgentFleetSnapshot& value) {
   portENTER_CRITICAL(&mux_);
-  const bool changed = !bridgeSemanticallyEqual(model_.bridge, value);
-  model_.bridge = value;
-  if (changed) bumpRevisionLocked();
-  portEXIT_CRITICAL(&mux_);
-  return changed;
-}
-
-bool RuntimeState::setBridgeEndpoint(const BridgeEndpoint& value) {
-  portENTER_CRITICAL(&mux_);
-  const bool changed = model_.endpoint.port != value.port ||
-                       strcmp(model_.endpoint.host, value.host) != 0;
-  model_.endpoint = value;
+  const bool changed = !fleetSemanticallyEqual(model_.fleet, value);
+  model_.fleet = value;
   if (changed) bumpRevisionLocked();
   portEXIT_CRITICAL(&mux_);
   return changed;
