@@ -84,9 +84,6 @@ void printInfo() {
                 static_cast<unsigned long>(model.revision),
                 ui::panelJournalStateName(epd.journalState()),
                  ui::epdErrorName(epd.lastError()));
-  Serial.printf("display_refresh=%s partial_since_full=%u\n",
-                app::refreshKindName(epd.lastRefreshKind()),
-                refreshPolicy.partialRefreshesSinceFull());
   if (model.telemetry.batteryPercent >= 0) {
     Serial.printf("battery=%u mV (~%d%%)\n",
                   model.telemetry.batteryMillivolts,
@@ -299,7 +296,7 @@ void ensureDeviceServer(uint32_t nowMs) {
 }
 
 void serviceDisplay(uint32_t nowMs) {
-  if (runtimeState.consumeRefreshRequest()) refreshPolicy.forceFull(nowMs);
+  if (runtimeState.consumeRefreshRequest()) refreshPolicy.force(nowMs);
 
   const app::UiModel observed = runtimeState.snapshot();
   refreshPolicy.observe(observed, nowMs);
@@ -311,17 +308,13 @@ void serviceDisplay(uint32_t nowMs) {
     return;
   }
 
-  const app::RefreshPlan plan = refreshPolicy.plan();
-  Serial.printf(
-      "[display] %s revision %lu page %u window=%u,%u %ux%u starting\n",
-      app::refreshKindName(plan.kind),
-      static_cast<unsigned long>(observed.revision), observed.page,
-      plan.window.x, plan.window.y, plan.window.width, plan.window.height);
-  const bool ok = epd.refresh(observed, plan);
+  Serial.printf("[display] full revision %lu page %u starting\n",
+                static_cast<unsigned long>(observed.revision), observed.page);
+  const bool ok = epd.refresh(observed);
   const uint32_t finishedAtMs = millis();
   if (ok) {
     runtimeState.markDisplayed(finishedAtMs);
-    refreshPolicy.markCompleted(observed, epd.lastRefreshKind(), finishedAtMs);
+    refreshPolicy.markCompleted(observed, finishedAtMs);
     Serial.printf("[display] completed in %lu ms\n",
                   static_cast<unsigned long>(finishedAtMs - nowMs));
   } else {

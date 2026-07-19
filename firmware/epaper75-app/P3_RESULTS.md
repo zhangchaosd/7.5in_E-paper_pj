@@ -1,5 +1,10 @@
 # P3 refresh-strategy validation
 
+> **Withdrawn:** the `0.5.0-p1` partial-window strategy is not approved for
+> product use. After repeated live updates, the owner observed a persistent
+> half-screen shadow. A full refresh cleared it, and `0.5.1-p1` removes the
+> partial path entirely. See [`P4_RESULTS.md`](P4_RESULTS.md).
+
 Date: 2026-07-19
 Firmware: `0.5.0-p1`
 
@@ -51,7 +56,9 @@ installation identities are intentionally omitted.
 - The exact 800x480 Home and System previews both reported zero text overflow
   and zero text-box overlap.
 
-The owner should still visually confirm that the physical partial waveform did
-not visibly disturb pixels outside the selected window. Long-run residue at the
-24-partial/six-hour cleanup thresholds also remains an observation item rather
-than a one-cycle smoke-test result.
+Follow-up physical observation invalidated the one-cycle result: after 17
+partial updates the display had obvious half-screen shadowing despite
+`panel=powered_off` and `error=none`. This proves the issue is image quality,
+not a stuck BUSY/high-voltage state. Product firmware must not restore this
+strategy or tune its cleanup threshold as a substitute for disabling partial
+refresh.

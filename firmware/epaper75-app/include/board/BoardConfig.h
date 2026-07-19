@@ -4,7 +4,7 @@
 
 namespace board {
 
-constexpr char kFirmwareVersion[] = "0.5.0-p1";
+constexpr char kFirmwareVersion[] = "0.5.1-p1";
 constexpr uint32_t kSerialBaud = 115200;
 
 // 7.5-inch 800x480 black/white/red panel.  The flex is marked
@@ -46,14 +46,10 @@ constexpr uint32_t kSensorPeriodMs = 60000;
 // One Agent slot is polled per interval, so three configured machines are
 // each refreshed about once every 15 seconds without parallel HTTP pressure.
 constexpr uint32_t kAgentPollSlotPeriodMs = 5000;
-constexpr uint32_t kOrdinaryRefreshFloorMs = 60000;
-constexpr uint32_t kUrgentRefreshFloorMs = 30000;
-constexpr uint32_t kUiCoalesceMs = 400;
-// GDEW075Z08 supports partial windows but not a fast-partial waveform. Keep
-// global cleaning infrequent while bounding long-term partial-update residue.
-constexpr uint16_t kMaxPartialRefreshesBeforeFull = 24;
-constexpr uint32_t kFullRefreshMaintenanceMs = 6UL * 60UL * 60UL * 1000UL;
-constexpr uint8_t kPartialWindowFullThresholdPercent = 72;
+constexpr uint32_t kRoutineRefreshFloorMs = 5UL * 60UL * 1000UL;
+constexpr uint32_t kUrgentRefreshFloorMs = 60000;
+constexpr uint32_t kForcedRefreshFloorMs = 30000;
+constexpr uint32_t kUiCoalesceMs = 1500;
 
 constexpr uint16_t kDeviceHttpPort = 80;
 constexpr uint16_t kDefaultBridgePort = 8765;

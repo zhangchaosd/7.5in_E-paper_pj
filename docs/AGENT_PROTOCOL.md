@@ -2,7 +2,7 @@
 
 ## 适用范围
 
-`0.5.0-p1` 不读取旧桌面 Bridge 的 `GET /status`。墨水屏作为只读
+`0.5.1-p1` 不读取旧桌面 Bridge 的 `GET /status`。墨水屏作为只读
 看板，连接三个 Codex Monitor Agent（CMA）实例，消费 CMA `0.4.x` 的
 schema `1.1`。三个实例使用同一个 Codex 账号，因此：
 
@@ -177,5 +177,5 @@ Agent 数、需操作数、错误数、账号数据 availability/stale、Weekly 
 IP、SSID 或 MAC。设备 HTTP API 完全只读，没有 `/api/agents`、远程刷新
 或其他网络写入口；配置与手动刷新只能通过 USB 串口或实体按键完成。
 
-旧四站点 `NetworkProbe` 在 `0.5.0-p1` 中不启动，Home 和设备 API 都不再
+旧四站点 `NetworkProbe` 在 `0.5.1-p1` 中不启动，Home 和设备 API 都不再
 提供网络延迟数据。

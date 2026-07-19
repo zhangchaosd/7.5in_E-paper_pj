@@ -3,7 +3,6 @@
 #include <Arduino.h>
 
 #include "app/Models.h"
-#include "app/RefreshPolicy.h"
 #include "ui/Renderer.h"
 
 namespace ui {
@@ -43,22 +42,20 @@ class EpdController {
   EpdController(const EpdController&) = delete;
   EpdController& operator=(const EpdController&) = delete;
 
-  // The only public operation capable of changing the physical display. It
-  // executes one full or one bounded partial-window refresh and powers panel
-  // voltages off afterward. A failed partial update is retried once as a full
-  // refresh; any second failure latches an RTC fault.
-  bool refresh(const app::UiModel& model, const app::RefreshPlan& plan);
+  // The only public operation capable of changing the physical display. The
+  // recovered panel is full-refresh only after physical partial-window tests
+  // produced unacceptable half-screen shadowing. On failure this permits one
+  // reset/recovery attempt, then latches an RTC fault.
+  bool refresh(const app::UiModel& model);
 
   bool isFaultLocked() const { return faultLocked_; }
   PanelJournalState journalState() const { return journalState_; }
   EpdError lastError() const { return lastError_; }
   uint32_t lastRefreshDurationMs() const { return lastRefreshDurationMs_; }
-  app::RefreshKind lastRefreshKind() const { return lastRefreshKind_; }
 
  private:
   bool prepareInterruptedRefresh(PanelJournalState previousState);
-  bool performRefresh(const app::UiModel& model,
-                      const app::RefreshPlan& plan, bool recoveryAttempt);
+  bool performRefresh(const app::UiModel& model, bool recoveryAttempt);
   bool initializePanel(bool recoveryAttempt);
   bool waitUntilReady(uint32_t timeoutMs) const;
   void shutdownAfterFailure();
@@ -70,12 +67,10 @@ class EpdController {
   Renderer renderer_;
   PanelJournalState journalState_ = PanelJournalState::Unknown;
   EpdError lastError_ = EpdError::None;
-  app::RefreshKind lastRefreshKind_ = app::RefreshKind::None;
   uint32_t lastRefreshDurationMs_ = 0;
   bool faultLocked_ = false;
   bool refreshInProgress_ = false;
   bool busActive_ = false;
-  bool panelBaselineValid_ = false;
 };
 
 }  // namespace ui

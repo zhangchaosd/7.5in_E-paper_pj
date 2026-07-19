@@ -9,7 +9,7 @@
 - 顶栏只显示 Wi-Fi 图标和动态 `N/3` 在线数，不显示电池或 Bridge；
 - 三个用户按键、SHT30、Wi-Fi 配网、Agent Bearer 认证轮询和设备 HTTP API 已集成。
 
-当前已刷入固件是 `0.5.0-p1`，源码位于 [`firmware/epaper75-app`](firmware/epaper75-app)。
+当前已刷入固件是 `0.5.1-p1`，源码位于 [`firmware/epaper75-app`](firmware/epaper75-app)。
 [`firmware/epaper75-bringup`](firmware/epaper75-bringup) 是已验证的 P0 硬件诊断工程，只在硬件回归或恢复调查时使用。
 
 ## 快速开始
@@ -21,7 +21,7 @@
 3. [`docs/FLASH_SAFETY.md`](docs/FLASH_SAFETY.md)：唯一允许的刷写范围；
 4. [`docs/HARDWARE.md`](docs/HARDWARE.md)：已确认硬件、引脚和按键；
 5. [`docs/AGENT_PROTOCOL.md`](docs/AGENT_PROTOCOL.md)：三 Agent、Bearer 认证、schema 1.1 和设备配置契约。
-6. [`firmware/epaper75-app/P3_RESULTS.md`](firmware/epaper75-app/P3_RESULTS.md)：本版本刷新策略的脱敏验证记录。
+6. [`firmware/epaper75-app/P4_RESULTS.md`](firmware/epaper75-app/P4_RESULTS.md)：本版本全刷恢复策略的脱敏验证记录。
 
 macOS 初次安装依赖并构建：
 
@@ -56,9 +56,9 @@ Codex Monitor Agent 程序和它的上游协议资料不复制到本仓库。固
 
 ## 当前限制
 
-- 面板支持局部窗口更新，但不支持快速局刷；局部波形本身仍需十几秒，优化重点是只闪动脏区而非缩短波形；
-- 首次启动、页面切换、手动清理、大面积变化以及累计 24 次局刷或 6 小时后仍会全刷；
-- 刷新期间主循环上的按键扫描会暂停；Core 0 上的 HTTP API 和 Agent 轮询仍可运行；旧 NetworkProbe 在 `0.5.0-p1` 中不启动；
+- 实机重复局刷会产生明显半屏阴影，因此产品固件已禁用局刷和快速刷新；
+- 普通可见变化合并为每 5 分钟最多一次全刷，待操作/离线/错误等重要变化每 60 秒最多一次，页面切换和手动清理保留 30 秒下限；
+- 刷新期间主循环上的按键扫描会暂停；Core 0 上的 HTTP API 和 Agent 轮询仍可运行；旧 NetworkProbe 在 `0.5.1-p1` 中不启动；
 - 电量是电压曲线估算值，界面以 `~` 标识，仍需万用表校准；
 - Agent 请求使用共享 Bearer token；三个 endpoint 和 token 只能通过本地 USB 串口 `AGENTS` 命令写入，设备不提供网络配置接口；
 - 三个 Agent 中若有一台不在墨水屏可路由的网络，顶栏会如实显示小于 `3/3`，不会把配置数量当作在线数量；

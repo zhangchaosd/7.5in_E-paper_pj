@@ -10,10 +10,10 @@ The product target is a recovered 7.5-inch tri-color e-paper device. The canonic
 firmware/epaper75-app
 ```
 
-Current flashed version: `0.5.0-p1`. Its refresh-strategy validation record
-is `firmware/epaper75-app/P3_RESULTS.md`. `P2_RESULTS.md` is the preserved
-device record for `0.4.0-p1`, and `P1_RESULTS.md` is historical for
-`0.3.0-p1`.
+Current flashed version: `0.5.1-p1`. Its full-only recovery record is
+`firmware/epaper75-app/P4_RESULTS.md`. `P3_RESULTS.md` records the withdrawn
+`0.5.0-p1` partial-window experiment and must not be treated as an approved
+strategy. `P2_RESULTS.md` and `P1_RESULTS.md` preserve older history.
 
 `firmware/epaper75-bringup` is the P0 diagnostic/reference project. Keep it available for hardware regression work, but do not merge P0 display routines into the product firmware without review.
 
@@ -25,6 +25,7 @@ Start with:
 - `docs/FLASH_SAFETY.md`
 - `docs/AGENT_PROTOCOL.md`
 - `firmware/epaper75-app/ARCHITECTURE.md`
+- `firmware/epaper75-app/P4_RESULTS.md`
 - `firmware/epaper75-app/P3_RESULTS.md`
 - `firmware/epaper75-app/P2_RESULTS.md`
 - `firmware/epaper75-app/P1_RESULTS.md`
@@ -32,7 +33,7 @@ Start with:
 ## Non-negotiable hardware and flash safety
 
 1. The target is an ESP32-WROOM-32E with 8 MB flash and no PSRAM.
-2. The panel is 800x480 black/white/red. Use `GxEPD2_750c_Z08` and the existing project-specific bounded BUSY full/partial-refresh path.
+2. The panel is 800x480 black/white/red. Use `GxEPD2_750c_Z08` and the existing project-specific bounded BUSY full-refresh path. Partial-window refresh is prohibited: physical testing caused persistent half-screen shadowing.
 3. Only the app0 partition at offset `0x10000` may be written during normal development.
 4. Never erase the full flash. Never overwrite the bootloader, partition table, NVS, OTA data, app1, or SPIFFS.
 5. Never use an IDE/PlatformIO generic upload action on this device; those flows can write more than app0.
@@ -79,11 +80,12 @@ Final physical order on the right edge, top to bottom: USB-C, power switch, EN/r
 - Red is reserved for the title accent, low quota, and action/error/offline states.
 - Short buttons: Upper next page, Middle refresh, Lower back.
 - Long buttons: Upper immediate Agent poll, Middle System page, Lower Home.
-- Keep the event-driven 30/60 second floors. The pinned Z08 driver confirms
-  partial-window support but explicitly reports no fast-partial waveform.
-  Merge all dirty regions into at most one partial window per cycle; use full
-  refresh for first boot, page changes, explicit cleanup, large dirty areas,
-  and bounded residue cleanup. Never fake or enable fast partial refresh.
+- Use only the proven full-screen waveform. Routine visible changes are batched
+  to a five-minute floor, urgent attention/offline/error transitions to a
+  60-second floor, and explicit/page-change refreshes retain a 30-second floor.
+  Ignore changes not visible on the current page. Never re-enable partial or
+  fast refresh from library capability flags alone; the physical `0.5.0-p1`
+  trial produced unacceptable half-screen shadowing after repeated updates.
 
 ## Architecture map
 
@@ -96,11 +98,11 @@ ui/     rendering and the only physical panel-refresh entry point
 
 The HTTP task and Agent polling task run on Core 0. Button scanning and the
 display state machine run from the Arduino main loop on Core 1. The legacy
-`NetworkProbe` implementation is not started in `0.5.0-p1`. HTTP handlers only
+`NetworkProbe` implementation is not started in `0.5.1-p1`. HTTP handlers only
 mutate cached state or queue refreshes; they must never call the display
 directly.
 
-All display traffic must continue through `ui::EpdController`. The bounded recovery, RTC journal, one-retry rule, power-off step, partial-to-full recovery promotion, and `FaultLocked` behavior are safety mechanisms, not optional abstractions.
+All display traffic must continue through `ui::EpdController`. The bounded recovery, RTC journal, one-retry rule, power-off step, and `FaultLocked` behavior are safety mechanisms, not optional abstractions.
 
 ## Reproducible build
 
@@ -149,7 +151,7 @@ For source or build-script changes:
 - review that no command writes outside `0x10000`;
 - check static RAM/flash usage for regressions.
 
-For hardware-visible changes, also perform a proportionate smoke test: serial boot with no panic, Wi-Fi/Agent health, button mapping, one physical full refresh, one bounded partial-window refresh when applicable, and final `panel=powered_off`. Never publish raw network identifiers from that test.
+For hardware-visible changes, also perform a proportionate smoke test: serial boot with no panic, Wi-Fi/Agent health, button mapping, one physical full refresh, and final `panel=powered_off`. Partial-window testing requires a separate owner-approved hardware experiment and must not enter product firmware. Never publish raw network identifiers from that test.
 
 ## Agent boundary
 
@@ -195,12 +197,12 @@ the device HTTP API.
 - Use small, reviewable commits and update documentation when pin maps, protocol fields, safety rules, or tool versions change.
 - Prefer portable paths and POSIX shell for macOS support; keep PowerShell equivalents for Windows device work.
 
-For renderer changes, make and inspect an 800x480 preview before building or flashing. For `EpdController`, partial-window geometry, BUSY handling, reset, power-off, or journal changes, raise the review and physical-test level; never validate those changes by UI inspection alone.
+For renderer changes, make and inspect an 800x480 preview before building or flashing. For `EpdController`, BUSY handling, reset, power-off, or journal changes, raise the review and physical-test level; never validate those changes by UI inspection alone.
 
 ## Current open hardware work
 
-- Continue observing `0.5.0-p1` partial-window residue and tune the 24-update /
-  6-hour full-clean thresholds only from physical evidence.
+- Visually confirm that the `0.5.1-p1` recovery full refresh removed the
+  half-screen shadow left by the withdrawn partial-window experiment.
 - Test EN/reset during an active refresh and confirm bounded recovery without a refresh loop.
 - Calibrate battery voltage/percentage against a multimeter.
 - Compare SHT30 readings after USB/charger heat settles.
