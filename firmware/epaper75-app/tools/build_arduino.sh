@@ -46,7 +46,7 @@ mkdir -p "$build_dir"
 "$arduino_cli" compile \
   --fqbn "$fqbn" \
   --build-path "$build_dir" \
-  --build-property "compiler.cpp.extra_flags=-I$include_dir" \
+  --build-property "compiler.cpp.extra_flags=\"-I$include_dir\"" \
   --libraries "$libraries_dir" \
   "$sketch_dir"
 

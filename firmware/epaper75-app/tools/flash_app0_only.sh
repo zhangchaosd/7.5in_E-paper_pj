@@ -95,7 +95,7 @@ while read -r expected_hash backup_name; do
     exit 1
   fi
   canonical_backup_path="$(cd -- "$(dirname -- "$backup_path")" && pwd -P)/$(basename "$backup_path")"
-  for seen_backup_path in "${seen_backup_paths[@]}"; do
+  for seen_backup_path in ${seen_backup_paths[@]+"${seen_backup_paths[@]}"}; do
     if [[ "$seen_backup_path" == "$canonical_backup_path" ]]; then
       echo "Factory backup manifest contains a duplicate file entry: $backup_name" >&2
       exit 1
