@@ -4,14 +4,19 @@ This file is the fast-start contract for AI agents and developers working in thi
 
 ## Goal and canonical project
 
-The product target is a recovered 7.5-inch tri-color e-paper device. The canonical firmware is:
+The product target is a recovered 7.5-inch tri-color e-paper device showing a
+month calendar (lunar dates, solar terms, statutory holidays) and QWeather
+current conditions, air quality, alerts and a six-day forecast. The canonical
+firmware is:
 
 ```text
 firmware/epaper75-app
 ```
 
-Current flashed version: `0.5.1-p1`. Its full-only recovery record is
-`firmware/epaper75-app/P4_RESULTS.md`. `P3_RESULTS.md` records the withdrawn
+Current flashed version: `0.6.0-p1` (calendar + weather, deep sleep); its
+flash and smoke-test record is `firmware/epaper75-app/P5_RESULTS.md`. Before
+it, app0 held an unrecorded `0.6.0-p1` build whose source is not in this
+repository (see P5). `P4_RESULTS.md` records `0.5.1-p1` (Codex fleet dashboard). `P3_RESULTS.md` records the withdrawn
 `0.5.0-p1` partial-window experiment and must not be treated as an approved
 strategy. `P2_RESULTS.md` and `P1_RESULTS.md` preserve older history.
 
@@ -23,12 +28,12 @@ Start with:
 - `docs/HARDWARE.md`
 - `docs/DEVELOPMENT.md`
 - `docs/FLASH_SAFETY.md`
-- `docs/AGENT_PROTOCOL.md`
+- `docs/POWER.md`
+- `docs/WEATHER_PROTOCOL.md`
 - `firmware/epaper75-app/ARCHITECTURE.md`
+- `firmware/epaper75-app/P5_RESULTS.md`
 - `firmware/epaper75-app/P4_RESULTS.md`
 - `firmware/epaper75-app/P3_RESULTS.md`
-- `firmware/epaper75-app/P2_RESULTS.md`
-- `firmware/epaper75-app/P1_RESULTS.md`
 
 ## Non-negotiable hardware and flash safety
 
@@ -60,7 +65,7 @@ If a proposed change weakens any of these constraints, stop and ask the owner.
 | Battery ADC | 36 |
 | Upper / Middle / Lower buttons | 34 / 35 / 39 |
 
-GPIO25 enables both the SHT30 low-side ground path and the battery divider. It must normally remain LOW and be raised only for a bounded sensor/battery sample. It is not a system power-hold pin.
+GPIO25 enables both the SHT30 low-side ground path and the battery divider. It must normally remain LOW and be raised only for a bounded sensor/battery sample; it is held LOW with `gpio_hold_en` through deep sleep. It is not a system power-hold pin.
 
 After sampling, return the I2C pins to input as the existing board code does, preventing back-power through SDA/SCL. GPIO34/35/39 have external 10k pull-ups and must not use `INPUT_PULLUP`. GPIO0 belongs to CH340 auto-download control. The unpopulated 8025 footprint is not an available RTC, and charger status LEDs are not connected to readable GPIOs.
 
@@ -68,39 +73,43 @@ Final physical order on the right edge, top to bottom: USB-C, power switch, EN/r
 
 ## Product behavior that must be preserved
 
-- Home page left: the shared Codex account's Weekly remaining quota, absolute reset time, selected source Agent, availability, and update time.
-- Home page right: exactly three configured Agent devices, each with reachability, workload/activity, bounded task text, counts, and whether user action is required.
-- The account quota source is Agent slot 0 first; another verified Agent may supply fallback account data because all three installations use the same Codex account. Slot 0 is fixed as primary.
-- The Weekly bar shows remaining capacity: `100 - used_percent`; it starts full after reset and drains with use.
-- Reset time is an absolute `YYYY-MM-DD HH:MM` time in UTC+8, not a countdown.
-- Temperature and humidity belong on the System page, not Home.
+- Home: header (place name from GeoAPI, "HH:MM 更新" or a red stale /
+  alert banner, red low-battery mark only at <= ~15%, Wi-Fi state); today panel
+  (date, weekday, lunar date, festival/solar-term/休/班 chips, ISO week);
+  current weather (icon, temperature, condition, high/low, feels-like); facts
+  grid (wind, AQI, humidity, sunrise, sunset, today's precipitation chance); Monday-first
+  month calendar with lunar labels and 休/班 marks; six-day forecast strip.
+- System page: battery `~NN%` and voltage, next wake, wake count, last fetch
+  result/time, alerts, Wi-Fi, firmware, refresh mode. Indoor temperature and
+  humidity are intentionally not shown and the SHT30 is not sampled.
 - Battery percentage is voltage-derived and must remain visibly approximate (`~`).
-- Home has no button legend, IP/subtitle row, or bottom help copy.
-- Header contains the title, Wi-Fi icon, and a live `N/3` Agent count only. It must not show battery or a Bridge icon.
-- Red is reserved for the title accent, low quota, and action/error/offline states.
-- Short buttons: Upper next page, Middle refresh, Lower back.
-- Long buttons: Upper immediate Agent poll, Middle System page, Lower Home.
-- Use only the proven full-screen waveform. Routine visible changes are batched
-  to a five-minute floor, urgent attention/offline/error transitions to a
-  60-second floor, and explicit/page-change refreshes retain a 30-second floor.
-  Ignore changes not visible on the current page. Never re-enable partial or
+- Home has no button legend or help copy. By owner decision no QWeather
+  wording is shown on screen (check the QWeather terms before publishing).
+- Red is reserved for the title accent, today, weekend headers, festivals and
+  solar terms, 休 marks, the sun, severe weather, poor AQI, alerts, stale or
+  failed data and low battery.
+- Short buttons: Upper Home/System, Middle fetch + redraw, Lower Home.
+  Long buttons: Upper fetch, Middle System, Lower Home. Only Upper and Middle
+  can wake from deep sleep (ESP32 ext0/ext1).
+- Power: deep sleep between the fixed wake table in `docs/POWER.md`; redraw
+  only when the visible-content signature changed; radio on only during a
+  fetch. Use only the proven full-screen waveform. Never re-enable partial or
   fast refresh from library capability flags alone; the physical `0.5.0-p1`
   trial produced unacceptable half-screen shadowing after repeated updates.
 
 ## Architecture map
 
 ```text
-board/  GPIO startup, buttons, SHT30, battery sampling
-net/    Wi-Fi provisioning, private Agent settings/client, HTTP API
-app/    fixed-size shared state and refresh policy
-ui/     rendering and the only physical panel-refresh entry point
+board/    GPIO startup, buttons, SHT30, battery sampling
+cal/      offline lunar calendar, solar terms, festivals, holiday table
+weather/  condition-code text/icons, wind and AQI wording
+net/      settings (NVS), Wi-Fi + NTP, QWeather client (JWT, TLS, gzip)
+app/      display model, visible signature, wake schedule
+ui/       fonts, icons, renderer and the only physical panel-refresh entry point
 ```
 
-The HTTP task and Agent polling task run on Core 0. Button scanning and the
-display state machine run from the Arduino main loop on Core 1. The legacy
-`NetworkProbe` implementation is not started in `0.5.1-p1`. HTTP handlers only
-mutate cached state or queue refreshes; they must never call the display
-directly.
+Everything runs sequentially on the Arduino loop task and every boot ends in
+deep sleep. There is no device HTTP server and no background network task.
 
 All display traffic must continue through `ui::EpdController`. The bounded recovery, RTC journal, one-retry rule, power-off step, and `FaultLocked` behavior are safety mechanisms, not optional abstractions.
 
@@ -151,46 +160,42 @@ For source or build-script changes:
 - review that no command writes outside `0x10000`;
 - check static RAM/flash usage for regressions.
 
-For hardware-visible changes, also perform a proportionate smoke test: serial boot with no panic, Wi-Fi/Agent health, button mapping, one physical full refresh, and final `panel=powered_off`. Partial-window testing requires a separate owner-approved hardware experiment and must not enter product firmware. Never publish raw network identifiers from that test.
+Also run `tools/hosttest/run_host_tests.sh` and regenerate the renderer preview
+with `tools/preview/build_preview.sh` for any change in `app/`, `cal/`, `net/`
+parsers, `weather/` or `ui/`.
 
-## Agent boundary
+For hardware-visible changes, also perform a proportionate smoke test: serial boot with no panic, Wi-Fi and QWeather fetch result, button mapping and both wake buttons, one physical full refresh, a timer wake, and final `panel=powered_off`. Partial-window testing requires a separate owner-approved hardware experiment and must not enter product firmware. Never publish raw network identifiers from that test.
 
-The firmware consumes Codex Monitor Agent `0.4.x` schema `1.1` over HTTP. Every
-JSON request uses `Authorization: Bearer <token>`. It verifies schema major 1
-and a stable `installation_id` through `GET /api/v1/version`, then polls one of
-three slots every five seconds with `GET /api/v1/status`; each Agent is visited
-about every 15 seconds. It requests `GET /api/v1/threads?limit=12` only when
-needed for current activity and polls account-level `GET /api/v1/rate-limits`
-on a 60-second cadence, fixed slot 0 first with verified fallback.
+## Weather service boundary
 
-An HTTP 401 locks that Agent until configuration changes. The first authenticated
-identity is pinned in private NVS; an incompatible schema or later changed
-installation identity is a protocol error and remains locked until configuration
-changes. Ordinary transport failures move through
-recovery and become offline after three consecutive failures. Do not collapse
-unknown, stale, unavailable, idle, offline, auth error, and protocol error into
-one state.
+The firmware calls the account-specific QWeather API Host over verified HTTPS
+with an on-device Ed25519 JWT (`kid` = credential ID, `iss` = developer ID,
+`sub` = project ID, 15-minute lifetime after NTP sync). The consumed endpoints
+and fields are documented in `docs/WEATHER_PROTOCOL.md`. Do not switch to the
+retired public hosts or to API-KEY authentication.
 
-Three endpoints and one shared Bearer token are persisted in the project-owned
-NVS blob only through the physical USB serial command
-`AGENTS <endpoint0> <endpoint1> <endpoint2> <token>`. Slot 0 is always primary.
-There is no network configuration endpoint; never reintroduce
-`POST /api/agents` without owner review and an authenticated design. Agent
-hosts, token, and installation IDs must stay in `SettingsStore`/`AgentClient`;
-they must never enter `UiModel`, HTTP responses, renderer output, serial output,
-or Git. The raw `AGENTS` input line is secret and must not be captured in logs
-or responses. The complete consumed-field and provisioning contract is
-documented in `docs/AGENT_PROTOCOL.md`. `docs/BRIDGE_PROTOCOL.md` is only a
-compatibility pointer for the retired `0.3.x` Bridge path.
+The API Host, the three IDs, the Ed25519 private key and the coordinates are
+persisted in the project-owned NVS namespace only through the physical USB
+serial commands `QWEATHER ...` and `LOCATION ...` (helper:
+`tools/provision_qweather.sh`). They must stay in `SettingsStore`/
+`WeatherClient` and never enter `UiModel`, renderer output, serial output, Git,
+screenshots or test logs. The raw `QWEATHER` line is secret. There is no
+network configuration endpoint; never add one or put these values into the
+Wi-Fi portal without owner review.
 
-Do not vendor the external Agent program or the user's local Agent contract
-copies into this repository. Private Agent settings may be changed only over a
-locally controlled USB serial session. Never add them to Wi-Fi provisioning or
-the device HTTP API.
+Weather condition text is chosen by the firmware from `condition.code` so the
+generated font covers it; do not render arbitrary API text in fonts that lack
+GB2312 coverage.
+
+The retired Codex Monitor Agent client (`0.4.x`–`0.5.x`) and its contract
+(`docs/AGENT_PROTOCOL.md`) are historical only. The old `agent_fleet` NVS blob
+may still exist on a device flashed with 0.5.x; 0.6.x ignores it.
 
 ## Repository hygiene
 
 - Keep reverse-engineering dumps, downloaded vendor packages, SDKs, build caches, full flash images, and reference-project checkouts outside Git.
+- Font source files (Noto Sans SC OTF) stay outside Git; only the generated glyph tables in `src/ui/fonts/` are committed. Rerun `tools/gen/gen_fonts.sh` after adding Chinese UI strings.
+- Update the statutory holiday table in `src/cal/Calendar.cpp` every November.
 - Do not commit generated bootloader, partition, `boot_app0`, ELF, map, or object files.
 - Do not track firmware binaries in normal Git history. The project is GPL-3.0-only; publish a binary only through a reviewed release that satisfies `THIRD_PARTY_NOTICES.md` and makes the corresponding source/license materials available. Local builds remain under ignored `dist/`.
 - Preserve unrelated user work and local backups.
@@ -201,10 +206,12 @@ For renderer changes, make and inspect an 800x480 preview before building or fla
 
 ## Current open hardware work
 
-- Visually confirm that the `0.5.1-p1` recovery full refresh removed the
-  half-screen shadow left by the withdrawn partial-window experiment.
+- Flash `0.6.0-p1`, provision QWeather, and confirm real API field shapes
+  against the parsers (the v1 schemas were implemented from documentation).
+- Verify timer wake, Upper/Middle button wake, GPIO25 held LOW in sleep, and
+  that a held button does not cause a wake loop.
+- Measure deep-sleep current and per-wake energy; update `docs/POWER.md`.
+- Visually confirm full refresh leaves no half-screen shadow.
 - Test EN/reset during an active refresh and confirm bounded recovery without a refresh loop.
-- Calibrate battery voltage/percentage against a multimeter.
-- Compare SHT30 readings after USB/charger heat settles.
-- Measure panel high-voltage behavior during a forced BUSY fault.
-- Characterize current draw, low-voltage cutoff, sleep, and battery runtime before productization.
+- Calibrate battery voltage/percentage against a multimeter; validate the
+  3.45 V low-battery cutoff.

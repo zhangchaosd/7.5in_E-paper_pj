@@ -87,30 +87,36 @@ esp32:esp32:esp32:FlashSize=8M,PartitionScheme=custom,PSRAM=disabled,FlashMode=d
 
 已有 P0 `platformio.ini` 仅用于早期实验。常见 `espressif32` 平台目前不能等价复现已验证的 Arduino ESP32 core 3.3.10 组合，而且默认 upload 流程可能写入 app0 之外的区域。因此 P1 的规范构建和刷写只使用本仓库脚本。
 
-## Codex Monitor Agent
+## 和风天气与私密配置
 
-固件本身不读取电脑上的 Codex 文件或凭据。`AgentClient` 在 Core 0
-依次连接三个局域网 Codex Monitor Agent，使用共享 Bearer token 消费
-CMA `0.4.x` schema `1.1`。设备活动是每个 Agent 独立的数据；Weekly
-限额是共享账号数据，固定优先从槽位 0 获取并允许经身份验证的回退。
+固件直接访问和风天气，契约见 [`WEATHER_PROTOCOL.md`](WEATHER_PROTOCOL.md)，
+刷新与省电策略见 [`POWER.md`](POWER.md)。开发时注意：
 
-完整协议和安全边界见 [`AGENT_PROTOCOL.md`](AGENT_PROTOCOL.md)。开发时尤其
-注意：
+- 用 `tools/qweather_keygen.swift` 生成专用 Ed25519 密钥对（macOS 自带
+  LibreSSL 不支持 Ed25519），不要复用 SSH 等其他用途的密钥；
+- API Host、开发者 ID、项目 ID、凭据 ID、私钥和坐标只能通过本地 USB 串口
+  （`tools/provision_qweather.sh`）写入项目自有 NVS，不写进源码、构建参数、
+  Git、截图和测试输出；
+- 打开串口会复位开发板并进入 90 秒清醒窗口，串口命令只在清醒时有效。
 
-- 不把真实 Agent 地址、token、`installation_id`、设备 IP、SSID 或 MAC
-  写进源码、构建参数、Git、截图和测试输出；
-- 三个 endpoint 和共享 token 只能通过本地 USB 串口命令
-  `AGENTS <endpoint0> <endpoint1> <endpoint2> <token>` 保存到项目自有 NVS
-  blob；槽位 0 固定为主来源；
-- 固件没有 `/api/agents` 或其他网络私密配置入口；不要通过 Wi-Fi 配网页、
-  HTTP、命令行参数或编译宏传入这些值；
-- 使用不回显、不保存会话日志的本地串口工具发送 `AGENTS` 命令；只确认
-  固件返回脱敏的成功/失败信息，不复制原始命令到测试记录；
-- 401、schema 不兼容或安装身份变化会锁定对应槽位，修改配置后才重试；
-- 顶栏 `N/3` 必须来自实时在线状态，不能用已配置数量替代。
+## 主机测试、界面预览与数据生成
 
-`docs/BRIDGE_PROTOCOL.md` 仅保留为 `0.3.x` 旧版迁移指针。当前固件不再
-依赖外部 `AIClockBridge` 或 `GET /status`。
+```bash
+cd firmware/epaper75-app
+./tools/hosttest/run_host_tests.sh            # 解析器、调度表、签名、Base64 等
+./tools/preview/build_preview.sh /tmp/ep75    # 用真实渲染器生成 800x480 PNG
+```
+
+只在 macOS 上需要重新生成的数据（生成结果已提交）：
+
+```bash
+swift tools/gen/gen_calendar.swift > include/cal/CalendarData.h
+tools/gen/gen_fonts.sh
+```
+
+`gen_fonts.sh` 需要把 Noto Sans SC 的 Regular/Bold OTF 放在
+`~/Library/Caches/epaper75-fonts/`（或用 `EPAPER75_FONT_DIR` 指定），字体文件
+不进入 Git。新增中文界面字符串后必须重新生成字库。
 
 ## 提交前检查
 
@@ -129,6 +135,6 @@ git status --short
 
 实机测试必须与改动风险相称。UI 改动至少确认一次完整刷新后
 `panel=powered_off`。产品固件禁止局刷：`0.5.0-p1` 实测连续局刷会产生
-半屏阴影，不能仅凭 GxEPD2 能力标志重新启用。并发/网络改动还要检查按键、
-三个 Agent 的安全聚合 health、401/离线退化和无 panic。测试回报中隐藏
-所有网络、串口、凭据和 Agent 安装标识。
+半屏阴影，不能仅凭 GxEPD2 能力标志重新启用。网络/电源改动还要检查按键唤醒、
+定时唤醒、取数失败退化（无 Wi-Fi、401）和无 panic。测试回报中隐藏所有网络、
+串口、凭据和坐标信息。

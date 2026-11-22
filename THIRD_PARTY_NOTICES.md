@@ -20,6 +20,18 @@ Upstream projects:
 - <https://github.com/bblanchon/ArduinoJson>
 - <https://github.com/tzapu/WiFiManager>
 
+Bundled data:
+
+| Material | Location | License |
+|---|---|---|
+| Glyph bitmaps rasterised from Noto Sans SC (Regular, Bold) | `firmware/epaper75-app/src/ui/fonts/` | SIL Open Font License 1.1 (<https://github.com/notofonts/noto-cjk>) |
+
+The font files themselves are not redistributed; the generated tables are a
+bitmap rendering of a subset of the font. A release must include the OFL text.
+Components used from the ESP32 core without vendoring include libsodium (ISC),
+miniz/tinfl in ROM (MIT) and the Mozilla CA certificate bundle (MPL-2.0).
+Weather data is provided by QWeather and attributed on screen.
+
 `firmware/epaper75-app/src/ui/EpdController.cpp` adapts the panel command and write sequence from `GxEPD2_750c_Z08`, authored by Jean-Marc Zingg. Adafruit GFX and BusIO retain the copyright and disclaimer terms supplied by Adafruit Industries. Other dependencies retain their respective upstream notices.
 
 Any precompiled firmware release must satisfy the project GPLv3 terms and all applicable source, copyright, disclaimer, and license-text obligations of the pinned dependencies. Re-check the exact upstream license files when preparing a release and include the corresponding source/build instructions. This notice is an engineering checklist, not a substitute for the upstream terms or legal advice.

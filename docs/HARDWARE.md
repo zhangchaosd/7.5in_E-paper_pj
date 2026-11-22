@@ -51,8 +51,9 @@ GPIO34/35/39 不支持内部上拉，必须使用板上已有的 10k 上拉；�
 5. Middle / GPIO35；
 6. Lower / GPIO39。
 
-短按：Upper 下一页、Middle 请求刷新、Lower 返回。长按：Upper 立即轮询
-三个 Agent（从固定主槽位 0 开始）、Middle 进入 System、Lower 回首页。
+短按（0.6.x）：Upper 首页/系统页切换、Middle 立即联网更新并刷新、Lower 回首页。
+长按：Upper 立即联网更新、Middle 进入系统页、Lower 回首页。深度睡眠时只有
+Upper（ext1）和 Middle（ext0）可以唤醒；GPIO39 无法作为第二个 ext 唤醒源。
 
 ## GPIO25 注意事项
 

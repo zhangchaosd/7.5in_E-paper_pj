@@ -53,14 +53,14 @@ macOS/Linux 必须使用：
 1. 串口无 boot loop、panic 或 brownout；
 2. 固件版本符合预期；
 3. Wi-Fi/NVS 配置仍保留；
-4. `/api/health` 的 Wi-Fi/Agent 安全聚合状态正常，且没有泄露 endpoint、token 或安装 ID；
-5. 三个按键映射不变；
+4. 串口 `INFO` 显示天气获取结果正常，且不输出 API Host、ID、私钥或坐标；
+5. 三个按键映射不变，Upper/Middle 能从深度睡眠唤醒；
 6. 做一次必要的物理全刷；产品固件不得执行局部窗口刷新；
 7. 确认全刷结束后画面无半屏阴影，最终再次确认
    `panel=powered_off` 和无显示错误。
 
-不要在公开日志中粘贴完整 `INFO`、原始 HTTP 响应或串口 `AGENTS` 配置命令；它们可能
-包含网络地址、Agent 端点、Bearer token、安装 ID 或串口标识。只报告经过
+不要在公开日志中粘贴完整 `INFO`、原始 HTTP 响应或串口 `QWEATHER`/`AGENTS` 配置命令；
+它们可能包含网络地址、API Host、凭据 ID、私钥、坐标或串口标识。只报告经过
 脱敏的布尔结果和聚合计数。
 
 ## 回退原则

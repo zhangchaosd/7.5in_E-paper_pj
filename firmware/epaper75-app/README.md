@@ -1,135 +1,83 @@
-# Epaper75 0.5.1 application
+# Epaper75 0.6 application
 
-This is the product firmware for the recovered ESP32 e-paper device. The
-current flashed version is `0.5.1-p1`. It is intentionally separate from
-`epaper75-bringup`, which remains the P0 hardware diagnostic and rollback
-reference.
+Product firmware for the recovered ESP32 e-paper device: a month calendar
+with lunar dates, solar terms and statutory holidays, plus current weather,
+air quality, alerts and a six-day forecast from QWeather. The device spends
+almost all of its time in deep sleep. `epaper75-bringup` remains the P0
+hardware diagnostic and rollback reference.
+
+Current flashed version: `0.6.0-p1`; flash and smoke-test record in
+`P5_RESULTS.md`. `P4_RESULTS.md` covers the earlier `0.5.1-p1` Codex dashboard.
 
 ## Confirmed hardware target
 
 - ESP32-WROOM-32E, 8 MB flash, no PSRAM
 - 7.5-inch 800x480 black/white/red panel using the proven
-  `GxEPD2_750c_Z08` driver
+  `GxEPD2_750c_Z08` driver, full refresh only
 - EPD: SCK 18, MOSI 23, CS 5, DC 19, RST 16, BUSY 17
 - SHT30: SDA 21, SCL 22, address 0x44
-- GPIO25 gates both SHT30 ground and the battery divider and is normally LOW
+- GPIO25 gates both SHT30 ground and the battery divider and is held LOW
+  through deep sleep
 - Battery ADC: GPIO36, nominal 10k/10k divider (field calibration still due)
-- Right-side order from top to bottom after USB-C and the power switch:
-  hardware EN reset, GPIO34 (Upper), GPIO35 (Middle), GPIO39 (Lower)
+- Right-side order: USB-C, power switch, EN reset, GPIO34 (Upper),
+  GPIO35 (Middle), GPIO39 (Lower)
 
-## Current behavior
+## Behavior
 
-- Keeps Wi-Fi credentials in the existing ESP32 Wi-Fi/NVS store and opens the
-  `Epaper75-Setup` captive portal only when normal connection fails.
-- Polls three Codex Monitor Agent `0.4.x` installations with a shared Bearer
-  token and the schema `1.1` contract. One Agent slot is polled every five
-  seconds, so each installation is normally visited about every 15 seconds.
-- Serves a privacy-bounded, read-only API on port 80: `/api/info` and
-  `/api/health`. There are no HTTP write routes or network endpoints for Agent
-  credentials.
-- Renders a dual-column Home page: shared Codex account Weekly
-  data on the left and three independent Agent activity rows on the right.
-- Agent slot 0 is the fixed preferred account source. Because all three
-  installations share one account, another identity-verified Agent may provide
-  fallback Weekly data.
-- The Weekly bar shows **remaining** quota (`100 - used_percent`), so a reset
-  starts full and normal use drains the bar. Reset time is an absolute
-  `YYYY-MM-DD HH:MM` clock time in UTC+8, not a countdown.
-- Each device row distinguishes running, approval, input, idle, error, stale,
-  offline, authentication and protocol states. Unknown is not treated as idle.
-- Shows a voltage-derived battery estimate as `~NN%`. The board has no fuel
-  gauge IC, so the result is intentionally marked approximate until the ADC
-  divider is calibrated against a multimeter. Battery remains on System and is
-  not shown in the Home header.
-- Uses a compact single-line header with title, Wi-Fi icon, and live `N/3`
-  Agent count only. The retired Bridge icon, battery, device/IP second line and
-  Home footnotes are omitted.
-- Does not start the legacy four-site `NetworkProbe`; Home and the device API
-  no longer provide network-latency data.
-- Keeps temperature and humidity on the System page only. Normal display
-  changes are rate-limited to protect the panel.
-- Uses the proven full-screen waveform only. A physical `0.5.0-p1` trial
-  produced persistent half-screen shadowing after repeated partial-window
-  updates, so both partial and fast refresh are prohibited.
-- Batches routine visible changes behind a five-minute floor. New attention,
-  offline and error transitions use a 60-second floor; explicit refreshes and
-  page changes retain a 30-second floor. Changes invisible on the current page
-  do not schedule a panel update.
-- Runs the HTTP API and Agent client on Core 0, so a long physical e-paper
-  refresh does not make discovery endpoints or Agent polling disappear.
+- Wakes on a fixed Beijing-time schedule (00:02, 06:30, 09:00, 12:00, 15:00,
+  18:00, 21:00 full updates; hourly alert checks 07–22 h) and redraws only when
+  the visible page changed. Details: [`../../docs/POWER.md`](../../docs/POWER.md).
+- Upper and Middle wake the device. Short: Upper toggles Home/System, Middle
+  fetches and redraws, Lower returns Home. Long: Upper fetches, Middle opens
+  System, Lower returns Home. The device stays awake 90 s after the last
+  button or serial command.
+- Wi-Fi uses the credentials already stored by the ESP32 driver. Without any
+  stored network the `Epaper75-Setup` portal opens (10 minute timeout); the
+  `WIFI SETUP` serial command reopens it.
+- QWeather access uses the account API Host and an on-device Ed25519 JWT;
+  details: [`../../docs/WEATHER_PROTOCOL.md`](../../docs/WEATHER_PROTOCOL.md).
+- Battery percentage is voltage-derived and always shown as `~NN%`; a red
+  battery mark appears in the Home header only at or below ~15%.
 
-The screen deliberately contains no button legend. In the final right-edge
-orientation, short presses are Upper (next page), Middle (refresh), and Lower
-(back); the separate uppermost control is the hardware EN/reset button.
-
-## Build
-
-The normative build is Arduino CLI with ESP32 core 3.3.10, GxEPD2 1.6.9,
-Adafruit GFX 1.12.6, Adafruit BusIO 1.17.4, ArduinoJson 7.4.3, and WiFiManager
-2.0.17. Windows PowerShell:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\tools\setup_arduino.ps1
-powershell -ExecutionPolicy Bypass -File .\tools\build_arduino.ps1
-```
-
-macOS/Linux:
+## Build, test and preview
 
 ```bash
 ./tools/setup_arduino.sh
-./tools/build_arduino.sh
+./tools/build_arduino.sh                 # app0 image into dist/
+./tools/hosttest/run_host_tests.sh       # parsers, schedule, signatures
+./tools/preview/build_preview.sh /tmp/epaper75-preview   # 800x480 PNGs
 ```
 
-Transient compiler output is placed below `%TEMP%` because the Espressif
-Windows assembler does not reliably emit object files under a path containing
-Chinese characters.
+Regenerating data (macOS only, outputs are committed):
 
-No PlatformIO environment is supplied yet: the official
-`espressif32@6.12.0` platform uses Arduino core 2.0.17 and is not equivalent to
-the verified 3.3.10 toolchain.  Adding a PIO configuration is deferred until it
-can pin the same core rather than silently changing runtime behavior.
+```bash
+swift tools/gen/gen_calendar.swift > include/cal/CalendarData.h
+tools/gen/gen_fonts.sh   # needs Noto Sans SC OTFs in ~/Library/Caches/epaper75-fonts
+```
+
+The normative toolchain is unchanged: Arduino CLI with ESP32 core 3.3.10,
+GxEPD2 1.6.9, Adafruit GFX 1.12.6, Adafruit BusIO 1.17.4, ArduinoJson 7.4.3,
+WiFiManager 2.0.17. JWT signing (libsodium), gzip (ROM tinfl) and the TLS root
+bundle all come from the core; no new libraries were added.
 
 ## Flash safety
 
-Only the locally built `dist/epaper75-p1-app.bin` at address `0x10000` is needed
-for the current device. The provided scripts refuse to proceed unless the
-caller explicitly confirms the verified factory backup:
+Only `dist/epaper75-p1-app.bin` at `0x10000` is ever written, through
+`tools/flash_app0_only.sh` / `.ps1`, after two verified factory backups exist.
+Read [`../../docs/FLASH_SAFETY.md`](../../docs/FLASH_SAFETY.md) first.
 
-```powershell
-powershell -ExecutionPolicy Bypass -File .\tools\flash_app0_only.ps1 `
-  -Port <COM端口> -VerifiedFactoryBackup
-```
+## Provisioning
 
-```bash
-./tools/flash_app0_only.sh --port /dev/cu.<device> --verified-factory-backup
-```
+1. Generate a dedicated key pair: `swift tools/qweather_keygen.swift`, upload
+   the printed public key in the QWeather console, note the credential ID.
+2. Write credentials and location over USB serial:
 
-This deliberately leaves the bootloader, partition table, NVS, OTA metadata,
-factory app1, and SPIFFS untouched.
+   ```bash
+   ./tools/provision_qweather.sh --port /dev/cu.<device> --lat <lat> --lon <lon> --reset
+   ```
 
-## Agent prerequisite and configuration
+   It prompts for the API Host, developer ID, project ID and credential ID,
+   reads the private key from `~/qweather-ed25519-private.pem`, and prints only
+   the device's redacted replies.
 
-Run a compatible Codex Monitor Agent on each of the three desktop devices. The
-firmware targets CMA `0.4.x` schema `1.1` and authenticates every JSON request
-with one shared Bearer token. The Agent executable and local contract copies
-are not vendored into this repository.
-
-Provision all three endpoints and the token over a locally controlled USB
-serial session at 115200 baud:
-
-```text
-AGENTS <endpoint0> <endpoint1> <endpoint2> <shared-token>
-```
-
-Slot 0 is always the primary account source. The firmware stores the complete
-setting in its private NVS blob and only prints a sanitized success or failure
-message; it does not echo arguments. Full field rules, polling behavior and
-failure semantics are in
-[`../../docs/AGENT_PROTOCOL.md`](../../docs/AGENT_PROTOCOL.md).
-
-Never put real endpoints, tokens, the raw serial command or installation IDs in
-source, Git, shell history, terminal logs, screenshots or test output. The
-firmware deliberately has no `/api/agents` or Wi-Fi provisioning field for
-these secrets. The retired Bridge workflow is documented only as a historical
-migration pointer in `../../docs/BRIDGE_PROTOCOL.md` and is not required by
-`0.5.1`.
+Never commit or paste the private key, API Host, IDs or coordinates.

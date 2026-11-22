@@ -1,3 +1,6 @@
+> **已退役（0.6.0 起）**：产品固件不再消费 Codex Monitor Agent。本文件只作为
+> `0.4.x`–`0.5.x` 的历史契约保留；当前数据源见 [`WEATHER_PROTOCOL.md`](WEATHER_PROTOCOL.md)。
+
 # Codex Monitor Agent 对接协议
 
 ## 适用范围

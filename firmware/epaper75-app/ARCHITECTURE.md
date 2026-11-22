@@ -1,204 +1,133 @@
-# Epaper75 0.5.1 architecture and feasibility
+# Epaper75 0.6 architecture
 
 ## System boundary
 
 ```mermaid
 flowchart LR
-    A1["Codex Monitor Agent 0\nschema 1.1"]
-    A2["Codex Monitor Agent 1\nschema 1.1"]
-    A3["Codex Monitor Agent 2\nschema 1.1"]
-    C["AgentClient\nBearer auth, staggered polling\nlow-priority core 0"]
-    K["SettingsStore\nprivate endpoints/token in NVS"]
-    U["Local USB serial\nAGENTS command"]
-    S["RuntimeState\nbounded display data only"]
-    H["Device HTTP API\nsafe aggregates, core 0"]
-    P["RefreshPolicy\nvisible-change filter + 30/60/300 s floors"]
+    Q["QWeather API Host\nHTTPS + Ed25519 JWT"]
+    N["NTP\nntp.aliyun.com / tencent / pool"]
+    W["WeatherClient\nTLS, gzip, bounded JSON"]
+    K["SettingsStore\nprivate credentials + location in NVS"]
+    U["Local USB serial\nQWEATHER / LOCATION"]
+    R["RTC memory\nweather cache, panel signature, wake plan"]
+    C["cal::\nlunar months, solar terms, holidays (offline)"]
+    S["DisplaySignature\nvisible-change filter"]
     E["EpdController\nbounded full-only state machine"]
     D["7.5-inch 800x480\nblack / white / red"]
-    X["SHT30 + battery + buttons\nGPIO25 gated, core 1"]
+    X["SHT30 + battery + buttons\nGPIO25 gated"]
 
-    A1 -->|"HTTP + Bearer"| C
-    A2 -->|"HTTP + Bearer"| C
-    A3 -->|"HTTP + Bearer"| C
-    K --> C
-    U -->|"private configuration"| K
+    Q --> W
+    N --> W
+    K --> W
+    U --> K
+    W --> R
+    R --> S
     C --> S
     X --> S
-    H <--> S
-    S --> P
-    P --> E
+    S --> E
     E --> D
 ```
 
-The three desktop Agents are the data sources. The ESP32 is a read-only fleet
-dashboard and a small device API; it does not read Codex files or credentials
-from a desktop directly and it does not approve or answer tasks.
+The device is a calendar and weather display. It talks to exactly two kinds of
+external services: the account-specific QWeather API Host and NTP. There is no
+device HTTP server, no Agent client, and no network configuration endpoint.
 
-All three Agent installations use one Codex account. Account quota is therefore
-one shared snapshot, while workload, thread and action state remain separate
-per installation. Slot 0 is the fixed preferred account source; another
-identity-verified Agent can provide fallback quota data.
-
-The retired `0.3.x` desktop Bridge and its `GET /status` payload are outside the
-current system. `docs/BRIDGE_PROTOCOL.md` exists only to keep historical links
-valid.
-
-## Firmware layers and tasks
+## Firmware layers
 
 | Layer | Responsibility |
 |---|---|
-| `board` | Safe GPIO startup, GPIO25-gated SHT30 and battery ADC, debounced semantic buttons |
-| `net` | NVS settings, Wi-Fi provisioning, authenticated three-Agent client, device HTTP API |
-| `app` | Fixed-size shared model, semantic revision tracking, conservative refresh scheduling |
-| `ui` | Fleet/System rendering and the only physical e-paper refresh entry point |
+| `board` | Safe GPIO startup, GPIO25-gated SHT30 and battery ADC, debounced buttons |
+| `cal` | Offline Gregorian/lunar calendar, 24 solar terms, festivals, statutory holiday table |
+| `weather` | Condition-code text and icon table, wind and AQI wording |
+| `net` | NVS settings, Wi-Fi connect/portal, NTP, QWeather client (JWT, TLS, gzip, parsers) |
+| `app` | Display model, visible-content signature, wake schedule |
+| `ui` | Bitmap fonts, icons, renderer, and the only panel-refresh entry point |
 
-`DeviceServer` runs on Core 0 at priority 2. `AgentClient` is a low-priority
-Core 0 task. Button scanning and the display state machine run from the Arduino
-main loop on Core 1. A long full-screen physical waveform can pause button
-scanning, but it does not directly block the Core 0 HTTP or Agent tasks.
+Everything runs on the Arduino loop task. Each boot is a short, sequential job
+that always ends in deep sleep:
 
-HTTP handlers expose read-only aggregates and never call the display. Agent
-endpoints, the shared Bearer token and the learned, NVS-pinned installation
-identities stay in `SettingsStore`/`AgentClient`. Only bounded,
-display-safe labels, task text, counts, enum states and timestamps enter
-`RuntimeState`.
+```text
+timer wake ─► early? sleep again
+           ─► low battery? draw low-battery mark (if changed), sleep 6 h
+           ─► Wi-Fi ─► NTP ─► fetch (full, or alerts then full if changed)
+           ─► radio off ─► redraw only if visible signature changed ─► sleep
 
-The legacy four-site DNS + TCP/443 `NetworkProbe` source remains available for
-historical diagnostics but is not started by `0.5.1-p1`. No probe task writes
-`RuntimeState`, no latency is rendered or returned by the device API, and
-latency jitter cannot trigger a physical refresh.
+button / power-on / EN ─► interactive window (90 s after last activity):
+           buttons, USB serial commands, optional Wi-Fi portal
+           ─► return to Home (redraw if needed) ─► sleep
+```
 
-## Agent client
+See [`../../docs/POWER.md`](../../docs/POWER.md) for the wake table, failure
+handling and energy estimate.
 
-The client targets Codex Monitor Agent `0.4.x` schema `1.1`. It sends
-`Authorization: Bearer <token>` on every request and uses bounded streaming JSON
-parsers. It verifies schema major 1 and captures a stable `installation_id`
-through `GET /api/v1/version` before trusting `GET /api/v1/status`.
+## State across deep sleep
 
-One configured slot is polled every five seconds, so each of the three Agents
-is normally visited about every 15 seconds. If status reports known active
-threads, the same slot also requests `GET /api/v1/threads?limit=12`. Candidate
-task priority is approval, input, running, then error; equal-priority tasks use
-the most recent `updated_at`. Display text is normalized into a fixed ASCII
-buffer.
+`RtcState` (`RTC_DATA_ATTR`) keeps the last weather snapshot, resolved place
+name, the signature and page of the image currently on the panel, the next
+wake epoch/kind and the retry counter. It is reset on power loss or EN. The
+system clock survives deep sleep on the RTC timer and is re-synchronised on
+every network session. The EPD journal keeps its own `RTC_NOINIT_ATTR` record
+as before.
 
-Account `GET /api/v1/rate-limits` is polled on a 60-second cadence. A quota cycle
-starts at fixed primary slot 0 and falls back through the other slots even when
-the primary Agent's version/status request fails.
-The parser accepts a 6-to-8-day window from `rateLimits.primary` or
-`rateLimits.secondary`, treats `usedPercent` as used capacity, and stores the
-epoch `resetsAt`. The UI displays `100 - usedPercent` and formats reset as an
-absolute UTC+8 time.
+Persistent NVS (namespace `ep75_p1`) holds the QWeather credential blob
+(CRC-checked), the packed coordinates, and the cached GeoAPI place name. The
+Wi-Fi driver's own namespace is never touched.
 
-Transport failures first enter recovery and become offline after three
-consecutive failures. Wi-Fi loss immediately makes configured slots offline.
-HTTP 401 locks the slot as an auth error until settings change. Incompatible
-schema or a changed installation identity locks it as a protocol error until
-settings change. Unknown, unavailable, stale, idle and offline remain distinct
-states.
+## Rendering
 
-The complete consumed-field and provisioning contract is in
-`../../docs/AGENT_PROTOCOL.md`.
+The renderer uses generated 1-bit fonts rasterised from Noto Sans SC (SIL OFL
+1.1) by `tools/gen/gen_fonts.sh` (CoreText on macOS). Two fonts contain all
+3755 GB2312 level-1 characters so API-provided place names render; the others
+contain only the characters used in source code, which the script collects
+automatically. Text is drawn as horizontal runs through `Adafruit_GFX`, so the
+same code runs on the panel and in the host preview.
 
-## Home and System pages
+Home page: header (place, update time or alert banner, low-battery
+mark, Wi-Fi state), today panel (date, weekday, lunar date, festival/solar
+term/holiday chips, ISO week), current weather (icon, temperature, condition,
+high/low, feels-like), a 3×2 facts grid (wind, AQI, humidity, sunrise, sunset,
+today's precipitation chance), a Monday-first month calendar with lunar labels and
+休/班 marks, and a six-day forecast strip.
 
-Home is a flat two-column composition:
+System page: approximate battery, voltage, next wake, wake count, wake
+duration, last fetch result/time, alerts, Wi-Fi, firmware and refresh mode.
+Indoor temperature/humidity are not displayed and the SHT30 is not sampled;
+only the battery divider is gated on for each wake.
 
-- Left: shared Codex account, Weekly remaining percentage/bar, absolute reset
-  time, primary/fallback source label, availability and source update time.
-- Right: three Agent rows with live workload, current task, workflow/worker
-  counts, waiting/error/run counts, activity age and action-required emphasis.
-- Header: `CODEX FLEET`, Wi-Fi icon and live `N/3` only. Battery and the retired
-  Bridge icon are not shown.
+Red is reserved for: title accent, today, weekend headers, festivals and solar
+terms, 休 marks, the sun, severe weather, poor AQI, alerts, stale/failed data
+and low battery.
 
-`N/3` counts only identity-verified, online, non-stale Agents. It is not the
-number of configured endpoints. Red is limited to the title accent, low quota,
-action-required and error/offline states.
+`tools/preview/build_preview.sh` compiles the real renderer with Adafruit GFX
+on the host and writes 800×480 PNGs for review before any flash.
 
-Temperature, humidity, approximate battery percentage/voltage, firmware and
-connectivity details remain on System. Home has no IP/subtitle row, button
-legend or bottom help copy.
+## Display lifecycle
 
-## Display lifecycle and refresh planning
-
-The pinned GxEPD2 Z08 driver advertises partial-window support, but physical
-testing on this recovered panel produced persistent half-screen shadowing after
-repeated partial updates. `0.5.1-p1` therefore treats the hardware as full-only;
-the library capability flag is not sufficient evidence to enable partial mode.
-The upstream full driver uses a `void` BUSY wait that merely logs a timeout, so
-the product firmware supplies a project-specific bounded path:
+Unchanged from 0.5.1: the recovered panel is full-refresh only. Physical
+testing of partial-window refresh produced persistent half-screen shadowing.
 
 ```text
 Unknown / PoweredOff
         -> bounded recovery wait when prior state is uncertain
         -> hardware reset + init
         -> full-width page writes
-           (0x91/0x90, black 0x10, red 0x13, 0x92)
-        -> one full refresh 0x12 with a bounded BUSY wait
-        -> bounded power-off 0x02
+        -> one full refresh with a bounded BUSY wait
+        -> bounded power-off
         -> PoweredOff
 
 Any failure -> one reset/recovery attempt -> FaultLocked
 ```
 
-The RTC journal uses a magic value and checksum in `RTC_NOINIT_ATTR`. It can
-survive deep sleep and resets that leave the RTC domain intact. EN/CHIP_PU,
-brownout, or full power loss may erase it; those cases become `Unknown` and use
-the conservative BUSY wait plus reset path. It is deliberately not written to
-NVS on every refresh, avoiding unnecessary flash wear.
+A fault-locked panel is never retried automatically; wakes continue to fetch
+data but skip the panel. A minimum 10 s gap separates interactive refreshes.
 
-`RefreshPolicy` compares the desired model with the last successfully displayed
-model and ignores fields that are not visible on the current page. It also
-continues to suppress timestamp-only and RSSI jitter. Routine visible changes
-are accumulated behind a five-minute floor, new approval/input/offline/error
-transitions use a 60-second floor, and page changes or explicit cleanup use a
-30-second floor. The first complete model is displayed after the normal startup
-grace without waiting five minutes. Every successful refresh ends with a
-bounded power-off and released SPI pins.
+## Calendar data
 
-## Device API
-
-| Method | Path | Current behavior |
-|---|---|---|
-| GET | `/api/info` | API/firmware/display metadata plus safe Wi-Fi, Agent and account aggregates |
-| GET | `/api/health` | Uptime, heap and safe Wi-Fi/Agent/account health aggregates |
-
-`/api/info` reports API version 2 and `showing=agent_fleet` or `system`. Neither
-read endpoint returns Agent hosts, token, installation IDs, device IP, SSID or
-MAC. There are no HTTP write routes; configuration, page changes and manual
-refresh remain local to USB serial or the physical buttons.
-
-## Provisioning and buttons
-
-- Stored ESP32 Wi-Fi credentials are reused and never erased automatically.
-- If initial connection has not succeeded after 12 seconds, WiFiManager opens
-  the non-blocking AP `Epaper75-Setup`.
-- After the device has connected once, a later disconnect uses automatic
-  reconnect and does not reopen the portal or compete with the device API for
-  port 80.
-- Three Agent endpoints and their shared token are accepted only through the
-  local USB serial command
-  `AGENTS <endpoint0> <endpoint1> <endpoint2> <token>`. Slot 0 is always
-  primary; the command and arguments must never be logged or echoed.
-- Right-side top-to-bottom order after the power switch: EN reset, Upper
-  GPIO34, Middle GPIO35, Lower GPIO39.
-- Short press: Upper next page, Middle rate-limited refresh, Lower back.
-- Long press: Upper immediate Agent poll, Middle System page, Lower Home.
-
-## Feasibility verdict
-
-| Area | Verdict | Remaining proof |
-|---|---|---|
-| ESP32 firmware and panel | Feasible with full refresh only | Visually accept shadow removal and continue refresh-interrupt tests for `0.5.1-p1` |
-| Three authenticated Agents | Feasible, implemented | Verify all reachable LAN routes, schema/identity locks, and one-Agent-offline degradation |
-| Shared Weekly account quota | Feasible, implemented | Confirm primary-first and fallback behavior with live CMA data |
-| Fleet UI | Feasible within e-paper constraints | Physical 800x480 visual acceptance and long-task truncation check |
-| SHT30, battery, buttons | Feasible and P0-proven | Battery calibration and enclosure temperature bias remain |
-| Animation/high-rate charts | Not suitable for this panel | Deliberately excluded |
-| Battery productization | Not yet proven | Current draw, low-voltage cutoff, sleep and runtime tests |
-
-The project remains technically viable. The dominant constraints are slow
-full refresh, physically unacceptable partial-window behavior, no PSRAM,
-plain-HTTP Agent transport on a trusted LAN, one
-potentially unroutable Agent network, uncalibrated battery measurement, and
-unmeasured panel high-voltage behavior under a forced BUSY fault.
+`include/cal/CalendarData.h` is generated by `tools/gen/gen_calendar.swift`:
+lunar month starts from the ICU Chinese calendar (verified on the host against
+Foundation for every day 2025–2035) and solar terms from the Meeus apparent
+solar longitude. Terms within 45 minutes of midnight were checked against
+published almanac times. The statutory holiday table in `src/cal/Calendar.cpp`
+covers 2026 and 2027 and must be extended each November when the State Council
+publishes the next schedule. Outside 2025–2035 the calendar still shows
+Gregorian dates without lunar data.
