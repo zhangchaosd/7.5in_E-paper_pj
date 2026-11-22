@@ -1,106 +1,346 @@
+// Epaper75 0.6.x: calendar + QWeather dashboard with a deep-sleep power plan.
+//
+// Every boot is one of:
+//   - timer wake: run the scheduled job (full update or alert check), redraw
+//     only if the visible page changed, then sleep until the next slot;
+//   - button wake (Upper/Middle) or cold boot (power, EN): stay awake for an
+//     interactive window that accepts buttons and USB serial commands;
+// and always ends in deep sleep. All work runs on the Arduino loop task; the
+// panel is driven only through ui::EpdController.
 #include <Arduino.h>
+#include <WiFi.h>
+#include <driver/gpio.h>
+#include <driver/rtc_io.h>
+#include <esp_sleep.h>
+#include <esp_system.h>
+#include <new>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
-#include <esp_system.h>
+#include <sys/time.h>
+#include <time.h>
 
-#include "app/RefreshPolicy.h"
-#include "app/RuntimeState.h"
+#include "app/DisplaySignature.h"
+#include "app/Models.h"
+#include "app/Schedule.h"
 #include "board/Board.h"
 #include "board/BoardConfig.h"
-#include "net/AgentClient.h"
 #include "net/Connectivity.h"
-#include "net/DeviceServer.h"
 #include "net/SettingsStore.h"
+#include "net/WeatherClient.h"
 #include "ui/EpdController.h"
 
 namespace {
 
-app::RuntimeState runtimeState;
+// ---------------------------------------------------------------------------
+// State that survives deep sleep (lost on power loss / EN reset).
+struct RtcState {
+  uint32_t magic;
+  uint32_t wakeCount;
+  app::WeatherSnapshot weather;
+  app::PlaceSnapshot place;
+  uint32_t displayedSignature;
+  bool displayedValid;
+  uint8_t displayedPage;
+  int64_t planEpoch;
+  uint8_t planKind;
+  uint8_t retries;
+};
+constexpr uint32_t kRtcMagic = 0x45503036;  // "EP06"
+// Raw storage on purpose: RtcState has default member initializers, and a
+// global object of that type would be re-constructed by the C++ runtime on
+// every deep-sleep wake, wiping the cache. It is constructed explicitly only
+// on a cold boot (see setup()).
+alignas(8) RTC_DATA_ATTR uint8_t rtcStorage[sizeof(RtcState)];
+RtcState& rtc = *reinterpret_cast<RtcState*>(rtcStorage);
+
 board::Board deviceBoard;
 net::SettingsStore settingsStore;
-net::Connectivity connectivity(runtimeState);
-net::AgentClient agentClient(runtimeState, settingsStore,
-                             board::kAgentPollSlotPeriodMs);
-net::DeviceServer deviceServer(runtimeState, board::kFirmwareVersion);
+net::Connectivity connectivity;
 ui::EpdController epd;
-app::RefreshPolicy refreshPolicy;
+net::WeatherSettings weatherSettings;
 
+app::TelemetrySnapshot telemetry;
+app::NetworkSnapshot lastNetwork;
+app::Page page = app::Page::Home;
+bool interactive = false;
+bool refreshPending = false;
+bool forceRefresh = false;
+uint32_t lastActivityMs = 0;
+uint32_t lastRefreshEndMs = 0;
 char serialLine[320] = {};
 size_t serialLength = 0;
-bool serverStarted = false;
-uint32_t lastServerAttemptAtMs = 0;
-uint32_t lastAgentTaskAttemptAtMs = 0;
-uint32_t lastSensorSampleAtMs = 0;
-// Give stored Wi-Fi credentials and the first Agent poll a chance to settle
-// before committing a 20+ second physical refresh.  If no Wi-Fi is available,
-// the system page is drawn just before the provisioning portal starts.
-constexpr uint32_t kInitialDisplayGraceMs = 10000;
 
-void publishTelemetry() {
-  const board::TelemetryReading reading = deviceBoard.sampleTelemetry();
-  app::TelemetrySnapshot snapshot;
-  snapshot.sensorOk = reading.environment.ok;
-  snapshot.temperatureC = reading.environment.temperatureC;
-  snapshot.humidityPercent = reading.environment.humidityPercent;
-  snapshot.batteryMillivolts = reading.battery.batteryMillivolts;
-  snapshot.batteryPercent = reading.battery.batteryPercent;
-  snapshot.sampledAtMs = reading.sampledAtMs;
-  runtimeState.updateTelemetry(snapshot);
-  lastSensorSampleAtMs = reading.sampledAtMs;
+// ---------------------------------------------------------------------------
+bool clockSynced() { return net::clockPlausible(); }
+int64_t nowEpoch() { return static_cast<int64_t>(time(nullptr)); }
 
-  if (reading.environment.ok) {
-    Serial.printf("[sensor] %.2f C, %.2f %%RH, battery %u mV (~%d%%)\n",
-                  reading.environment.temperatureC,
-                  reading.environment.humidityPercent,
-                  reading.battery.batteryMillivolts,
-                  reading.battery.batteryPercent);
-  } else {
-    Serial.printf("[sensor] SHT30 %s, battery %u mV (~%d%%)\n",
-                  board::sht30ErrorName(reading.environment.error),
-                  reading.battery.batteryMillivolts,
-                  reading.battery.batteryPercent);
+bool batteryLow() {
+  return telemetry.batteryMillivolts >= board::kBatteryAbsentMv &&
+         telemetry.batteryMillivolts < board::kBatteryCutoffMv;
+}
+
+// Only the battery is sampled; indoor temperature/humidity are not shown, so
+// the SHT30 stays unpowered (GPIO25 is raised only for the ADC sample).
+void sampleTelemetry() {
+  const board::BatteryReading battery = deviceBoard.readBattery();
+  telemetry.batteryMillivolts = battery.batteryMillivolts;
+  telemetry.batteryPercent = battery.batteryPercent;
+}
+
+app::UiModel buildModel() {
+  app::UiModel model;
+  model.weather = rtc.weather;
+  model.place = rtc.place;
+  model.telemetry = telemetry;
+  model.network = lastNetwork;
+  model.clockSynced = clockSynced();
+  model.nowEpoch = nowEpoch();
+  model.configured = weatherSettings.ready();
+  model.page = page;
+  model.wakeCount = rtc.wakeCount;
+  model.uptimeSeconds = millis() / 1000U;
+  if (model.clockSynced) {
+    const int64_t delta = rtc.planEpoch - model.nowEpoch;
+    model.nextWakeMinutes = delta > 0 ? static_cast<uint32_t>(delta / 60) : 0;
   }
+  return model;
+}
+
+// Full refresh only when the visible content differs (or when forced).
+bool updateDisplay(bool force) {
+  if (epd.isFaultLocked()) {
+    Serial.println("[display] fault-locked; skipped");
+    return false;
+  }
+  const app::UiModel model = buildModel();
+  const uint32_t signature = app::visibleSignature(model);
+  if (!force && rtc.displayedValid && rtc.displayedSignature == signature &&
+      rtc.displayedPage == static_cast<uint8_t>(page)) {
+    Serial.println("[display] unchanged; no refresh");
+    return true;
+  }
+  Serial.printf("[display] full refresh page %u\n", static_cast<unsigned>(page));
+  const uint32_t started = millis();
+  const bool ok = epd.refresh(model);
+  lastRefreshEndMs = millis();
+  if (ok) {
+    rtc.displayedSignature = signature;
+    rtc.displayedPage = static_cast<uint8_t>(page);
+    rtc.displayedValid = true;
+    Serial.printf("[display] completed in %lu ms\n",
+                  static_cast<unsigned long>(lastRefreshEndMs - started));
+  } else {
+    rtc.displayedValid = false;
+    Serial.printf("[display] failed: %s (journal=%s)\n",
+                  ui::epdErrorName(epd.lastError()),
+                  ui::panelJournalStateName(epd.journalState()));
+  }
+  return ok;
+}
+
+// ---------------------------------------------------------------------------
+// Network work. Returns true when the requested data was fetched.
+enum class FetchMode : uint8_t { Full, AlertsThenFullIfChanged };
+
+bool runFetch(FetchMode mode) {
+  if (batteryLow()) {
+    rtc.weather.lastError = app::WeatherError::LowBattery;
+    Serial.println("[weather] battery low; radio stays off");
+    return false;
+  }
+  if (!connectivity.connect(board::kWifiConnectTimeoutMs)) {
+    lastNetwork = app::NetworkSnapshot();
+    connectivity.disconnect();
+    rtc.weather.availability = app::DataAvailability::Unavailable;
+    rtc.weather.lastError = app::WeatherError::NoWifi;
+    Serial.println("[wifi] connect failed");
+    return false;
+  }
+  lastNetwork = connectivity.snapshot();
+  const bool synced = connectivity.syncClock(board::kClockSyncTimeoutMs);
+  Serial.printf("[clock] %s\n", synced ? "synchronized" : "sync failed");
+  if (!clockSynced()) {
+    connectivity.disconnect();
+    rtc.weather.availability = app::DataAvailability::Unavailable;
+    rtc.weather.lastError = app::WeatherError::ClockNotSynced;
+    return false;
+  }
+  if (!weatherSettings.ready()) {
+    connectivity.disconnect();
+    rtc.weather.lastError = app::WeatherError::NotConfigured;
+    return true;  // the clock (calendar) was still updated
+  }
+
+  net::WeatherClient client(weatherSettings);
+  const int64_t now = nowEpoch();
+  app::WeatherError error = app::WeatherError::None;
+  bool doFull = mode == FetchMode::Full;
+
+  if (!doFull) {
+    app::WeatherAlert alert;
+    error = client.fetchAlerts(now, alert);
+    if (error == app::WeatherError::None) {
+      doFull = alert.key != rtc.weather.alert.key ||
+               alert.active != rtc.weather.alert.active;
+      Serial.printf("[weather] alerts: %u active%s\n", alert.count,
+                    doFull ? " (changed)" : "");
+    }
+  }
+  if (doFull) {
+    error = client.fetchAll(now, rtc.weather);
+    Serial.printf("[weather] full fetch: %s (http %d, heap %lu, last body %u B)\n",
+                  app::weatherErrorName(error), client.lastHttpCode(),
+                  static_cast<unsigned long>(client.heapBeforeConnect()),
+                  static_cast<unsigned>(client.lastBodyLength()));
+    if (client.lastTransportError()[0] != '\0') {
+      Serial.printf("[weather] transport: %s\n", client.lastTransportError());
+    }
+  }
+  if (error == app::WeatherError::None && !rtc.place.valid) {
+    app::PlaceSnapshot place;
+    if (client.lookupPlace(now, place) == app::WeatherError::None) {
+      rtc.place = place;
+      net::PlaceCache cache;
+      cache.place = place;
+      cache.latitudeCenti = weatherSettings.latitudeCenti;
+      cache.longitudeCenti = weatherSettings.longitudeCenti;
+      settingsStore.savePlace(cache);
+    }
+  }
+  connectivity.disconnect();
+  if (error != app::WeatherError::None) {
+    rtc.weather.availability = app::DataAvailability::Unavailable;
+    rtc.weather.lastError = error;
+    return false;
+  }
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+void scheduleNext(bool fetchFailed) {
+  const int64_t now = nowEpoch();
+  if (!clockSynced()) {
+    rtc.planEpoch = now + app::kUnsyncedRetrySeconds;
+    rtc.planKind = static_cast<uint8_t>(app::WakeKind::FullUpdate);
+    return;
+  }
+  if (batteryLow()) {
+    rtc.planEpoch = now + app::kLowBatterySleepSeconds;
+    rtc.planKind = static_cast<uint8_t>(app::WakeKind::FullUpdate);
+    return;
+  }
+  if (fetchFailed && weatherSettings.ready() &&
+      rtc.retries < app::kMaxRetriesPerSlot) {
+    ++rtc.retries;
+    rtc.planEpoch = now + app::kRetryDelaySeconds;
+    return;  // keep the same kind
+  }
+  rtc.retries = 0;
+  const app::WakePlan plan = app::nextScheduledWake(now);
+  rtc.planEpoch = plan.epoch;
+  rtc.planKind = static_cast<uint8_t>(plan.kind);
+}
+
+[[noreturn]] void sleepUntilPlan() {
+  const int64_t now = nowEpoch();
+  int64_t seconds = rtc.planEpoch - now;
+  if (seconds < 30) seconds = 30;
+  Serial.printf("[power] deep sleep for %lld min\n",
+                static_cast<long long>(seconds / 60));
+  Serial.flush();
+
+  connectivity.disconnect();
+  // Keep the SHT30/battery gate (GPIO25) LOW through sleep.
+  digitalWrite(board::kPeripheralEnable, LOW);
+  gpio_hold_en(static_cast<gpio_num_t>(board::kPeripheralEnable));
+  gpio_deep_sleep_hold_en();
+
+  // Wait for buttons to be released so a held key does not wake us at once.
+  const uint32_t waitStart = millis();
+  while ((digitalRead(board::kButtonUpper) == LOW ||
+          digitalRead(board::kButtonMiddle) == LOW) &&
+         millis() - waitStart < 5000) {
+    delay(10);
+  }
+
+  esp_sleep_enable_timer_wakeup(static_cast<uint64_t>(seconds) * 1000000ULL);
+  // ESP32 ext1 cannot wake on "any low"; one pin with ALL_LOW is equivalent.
+  esp_sleep_enable_ext0_wakeup(static_cast<gpio_num_t>(board::kButtonMiddle), 0);
+  esp_sleep_enable_ext1_wakeup(1ULL << board::kButtonUpper,
+                               ESP_EXT1_WAKEUP_ALL_LOW);
+  esp_deep_sleep_start();
+}
+
+// ---------------------------------------------------------------------------
+void requestRefresh(bool force) {
+  refreshPending = true;
+  forceRefresh = forceRefresh || force;
+}
+
+void setPage(app::Page next) {
+  if (page != next) {
+    page = next;
+    requestRefresh(true);
+  }
+}
+
+void interactiveFetch() {
+  const bool ok = runFetch(FetchMode::Full);
+  scheduleNext(!ok);
+  requestRefresh(true);
 }
 
 void printInfo() {
-  const app::UiModel model = runtimeState.snapshot();
-  Serial.println("=== Epaper75 P1 ===");
-  Serial.printf("firmware=%s heap=%lu flash=%lu psram=%lu\n",
-                board::kFirmwareVersion,
+  const app::UiModel model = buildModel();
+  Serial.println("=== Epaper75 ===");
+  Serial.printf("firmware=%s heap=%lu wake=%lu\n", board::kFirmwareVersion,
                 static_cast<unsigned long>(ESP.getFreeHeap()),
-                static_cast<unsigned long>(ESP.getFlashChipSize()),
-                static_cast<unsigned long>(ESP.getPsramSize()));
-  Serial.printf("wifi=%s rssi=%d agents=%u/%u action=%u account=%s%s\n",
-                model.network.connected ? "connected" : "offline",
-                model.network.rssi,
-                static_cast<unsigned>(app::fleetOnlineCount(model.fleet)),
-                static_cast<unsigned>(app::kAgentDeviceCount),
-                static_cast<unsigned>(app::fleetActionCount(model.fleet)),
-                app::dataAvailabilityName(model.fleet.account.availability),
-                model.fleet.account.stale ? " stale" : "");
-  Serial.printf("mode=%s page=%u model_rev=%lu panel=%s error=%s\n",
-                app::displayModeName(model.mode), model.page,
-                static_cast<unsigned long>(model.revision),
-                ui::panelJournalStateName(epd.journalState()),
-                 ui::epdErrorName(epd.lastError()));
-  if (model.telemetry.batteryPercent >= 0) {
-    Serial.printf("battery=%u mV (~%d%%)\n",
-                  model.telemetry.batteryMillivolts,
-                  model.telemetry.batteryPercent);
+                static_cast<unsigned long>(rtc.wakeCount));
+  if (model.clockSynced) {
+    const time_t local = static_cast<time_t>(model.nowEpoch + 8 * 3600);
+    struct tm t;
+    gmtime_r(&local, &t);
+    Serial.printf("time=%04d-%02d-%02d %02d:%02d UTC+8\n", t.tm_year + 1900,
+                  t.tm_mon + 1, t.tm_mday, t.tm_hour, t.tm_min);
   }
+  Serial.printf("qweather=%s location=%s wifi_saved=%s clock=%s\n",
+                weatherSettings.hasCredentials ? "set" : "missing",
+                weatherSettings.hasLocation ? "set" : "missing",
+                connectivity.hasStoredCredentials() ? "yes" : "no",
+                model.clockSynced ? "synced" : "unsynced");
+  Serial.printf("weather=%s last_error=%s fetched_age_min=%lld alert=%s\n",
+                rtc.weather.availability == app::DataAvailability::Available
+                    ? "available"
+                    : (rtc.weather.availability == app::DataAvailability::Unknown
+                           ? "unknown"
+                           : "unavailable"),
+                app::weatherErrorName(rtc.weather.lastError),
+                rtc.weather.fetchedEpoch > 0
+                    ? static_cast<long long>((model.nowEpoch - rtc.weather.fetchedEpoch) / 60)
+                    : -1LL,
+                rtc.weather.alert.active ? "active" : "none");
+  Serial.printf("page=%u panel=%s error=%s next_wake_min=%lu\n",
+                static_cast<unsigned>(page),
+                ui::panelJournalStateName(epd.journalState()),
+                ui::epdErrorName(epd.lastError()),
+                static_cast<unsigned long>(model.nextWakeMinutes));
+  Serial.printf("battery=%u mV (~%d%%)\n", telemetry.batteryMillivolts,
+                telemetry.batteryPercent);
 }
 
 void printHelp() {
-  Serial.println("Commands:");
-  Serial.println("  INFO                  cached device state");
-  Serial.println("  SENSOR                sample SHT30 and battery now");
-  Serial.println("  POLL                  request an immediate Agent poll");
-  Serial.println("  AGENTS ...            write private Agent settings over USB");
-  Serial.println("  REFRESH               request a rate-limited full cleanup");
-  Serial.println("  PAGE 0|1              dashboard or system page");
-  Serial.println("  MODE auto|claude|codex");
-  Serial.println("  HELP");
+  Serial.println("Commands (device sleeps after 90 s without activity):");
+  Serial.println("  INFO                 redacted device state");
+  Serial.println("  FETCH                fetch weather now and redraw");
+  Serial.println("  REFRESH              force one full redraw");
+  Serial.println("  PAGE 0|1             home or system page");
+  Serial.println("  BATTERY              sample battery voltage");
+  Serial.println("  QWEATHER <api-host> <developer-id> <project-id> <credential-id> <private-key-base64>");
+  Serial.println("  QWEATHER CLEAR       erase stored QWeather settings");
+  Serial.println("  LOCATION <lat> <lon> e.g. LOCATION 39.92 116.41");
+  Serial.println("  WIFI SETUP           start the Epaper75-Setup portal");
+  Serial.println("  SLEEP                sleep now");
 }
 
 char* trimInPlace(char* value) {
@@ -111,103 +351,101 @@ char* trimInPlace(char* value) {
   return value;
 }
 
+void handleQWeather(char* arguments) {
+  if (strcasecmp(arguments, "CLEAR") == 0) {
+    settingsStore.clearWeather();
+    settingsStore.loadWeather(weatherSettings);
+    rtc.place = app::PlaceSnapshot();
+    Serial.println("[qweather] settings cleared");
+    requestRefresh(true);
+    return;
+  }
+  char* save = nullptr;
+  char* host = strtok_r(arguments, " \t", &save);
+  char* developer = strtok_r(nullptr, " \t", &save);
+  char* project = strtok_r(nullptr, " \t", &save);
+  char* credential = strtok_r(nullptr, " \t", &save);
+  char* key = strtok_r(nullptr, " \t", &save);
+  char* extra = strtok_r(nullptr, " \t", &save);
+
+  net::WeatherSettings next = weatherSettings;
+  bool ok = host && developer && project && credential && key && !extra &&
+            net::validateApiHost(host) && net::validateQWeatherId(developer) &&
+            net::validateQWeatherId(project) &&
+            net::validateQWeatherId(credential) &&
+            net::parseEd25519PrivateKey(key, next.seed);
+  if (key != nullptr) net::secureZero(key, strlen(key));
+  if (ok) {
+    app::copyText(next.apiHost, host);
+    app::copyText(next.developerId, developer);
+    app::copyText(next.projectId, project);
+    app::copyText(next.credentialId, credential);
+    ok = settingsStore.saveCredentials(next);
+  }
+  net::secureZero(next.seed, sizeof(next.seed));
+  if (!ok) {
+    Serial.println("[qweather] settings rejected");
+    return;
+  }
+  settingsStore.loadWeather(weatherSettings);
+  Serial.println("[qweather] settings stored");
+}
+
+void handleLocation(char* arguments) {
+  char* save = nullptr;
+  char* lat = strtok_r(arguments, " \t", &save);
+  char* lon = strtok_r(nullptr, " \t", &save);
+  int16_t latCenti = 0, lonCenti = 0;
+  if (lat == nullptr || lon == nullptr || strtok_r(nullptr, " \t", &save) ||
+      !net::parseCoordinate(lat, 9000, latCenti) ||
+      !net::parseCoordinate(lon, 18000, lonCenti) ||
+      !settingsStore.saveLocation(latCenti, lonCenti)) {
+    Serial.println("[location] rejected");
+    return;
+  }
+  settingsStore.loadWeather(weatherSettings);
+  rtc.place = app::PlaceSnapshot();
+  rtc.weather = app::WeatherSnapshot();
+  Serial.println("[location] stored");
+}
+
 void handleSerialCommand(char* input) {
   char* command = trimInPlace(input);
   if (*command == '\0') return;
-
-  if (strcasecmp(command, "HELP") == 0) {
-    printHelp();
-    return;
-  }
-  if (strcasecmp(command, "INFO") == 0) {
-    printInfo();
-    return;
-  }
-  if (strcasecmp(command, "SENSOR") == 0) {
-    publishTelemetry();
-    return;
-  }
-  if (strcasecmp(command, "POLL") == 0) {
-    agentClient.requestImmediatePoll();
-    Serial.println("[agents] immediate poll requested");
-    return;
-  }
-  if (strcasecmp(command, "REFRESH") == 0) {
-    runtimeState.requestRefresh();
-    Serial.println("[display] refresh queued (panel rate limit still applies)");
-    return;
-  }
+  lastActivityMs = millis();
 
   char* argument = strchr(command, ' ');
-  if (argument == nullptr) {
+  if (argument != nullptr) {
+    *argument++ = '\0';
+    argument = trimInPlace(argument);
+  }
+  if (strcasecmp(command, "HELP") == 0) {
+    printHelp();
+  } else if (strcasecmp(command, "INFO") == 0) {
+    printInfo();
+  } else if (strcasecmp(command, "BATTERY") == 0) {
+    sampleTelemetry();
+    printInfo();
+  } else if (strcasecmp(command, "FETCH") == 0) {
+    interactiveFetch();
+  } else if (strcasecmp(command, "REFRESH") == 0) {
+    requestRefresh(true);
+  } else if (strcasecmp(command, "SLEEP") == 0) {
+    lastActivityMs = millis() - board::kInteractiveWindowMs;
+  } else if (strcasecmp(command, "PAGE") == 0 && argument != nullptr &&
+             (strcmp(argument, "0") == 0 || strcmp(argument, "1") == 0)) {
+    setPage(argument[0] == '0' ? app::Page::Home : app::Page::System);
+  } else if (strcasecmp(command, "QWEATHER") == 0 && argument != nullptr) {
+    handleQWeather(argument);
+  } else if (strcasecmp(command, "LOCATION") == 0 && argument != nullptr) {
+    handleLocation(argument);
+  } else if (strcasecmp(command, "WIFI") == 0 && argument != nullptr &&
+             strcasecmp(argument, "SETUP") == 0) {
+    connectivity.startPortal();
+    Serial.printf("[wifi] portal %s\n", connectivity.portalActive() ? "started" : "failed");
+  } else {
     Serial.println("Unknown command. Type HELP.");
-    return;
   }
-  *argument++ = '\0';
-  argument = trimInPlace(argument);
-
-  if (strcasecmp(command, "PAGE") == 0) {
-    if (strcmp(argument, "0") != 0 && strcmp(argument, "1") != 0) {
-      Serial.println("PAGE must be 0 or 1.");
-      return;
-    }
-    runtimeState.setPage(static_cast<uint8_t>(argument[0] - '0'));
-    runtimeState.requestRefresh();
-    return;
-  }
-
-  if (strcasecmp(command, "AGENTS") == 0) {
-    net::AgentFleetSettings agents;
-    char* save = nullptr;
-    bool valid = true;
-    for (size_t i = 0; i < app::kAgentDeviceCount; ++i) {
-      char* endpoint = strtok_r(i == 0 ? argument : nullptr, " \t", &save);
-      if (endpoint == nullptr ||
-          !net::parseAgentEndpoint(endpoint, agents.endpoints[i])) {
-        valid = false;
-        break;
-      }
-    }
-    char* token = valid ? strtok_r(nullptr, " \t", &save) : nullptr;
-    char* extra = token != nullptr ? strtok_r(nullptr, " \t", &save) : nullptr;
-    if (token == nullptr || extra != nullptr ||
-        !net::validateAgentToken(token)) {
-      valid = false;
-    }
-    if (valid) {
-      strlcpy(agents.token, token, sizeof(agents.token));
-      agents.primaryIndex = 0;
-      valid = settingsStore.saveAgents(agents);
-      memset(agents.token, 0, sizeof(agents.token));
-    }
-    if (!valid) {
-      Serial.println("Agent settings rejected.");
-      return;
-    }
-    agentClient.requestImmediatePoll();
-    runtimeState.setPage(0);
-    runtimeState.requestRefresh();
-    Serial.println("[agents] private settings stored");
-    return;
-  }
-
-  if (strcasecmp(command, "MODE") == 0) {
-    app::DisplayMode mode;
-    if (!app::parseDisplayMode(argument, mode)) {
-      Serial.println("MODE must be auto, claude or codex.");
-      return;
-    }
-    if (!settingsStore.saveDisplayMode(mode)) {
-      Serial.println("Failed to persist display mode.");
-      return;
-    }
-    runtimeState.setDisplayMode(mode);
-    runtimeState.requestRefresh();
-    Serial.printf("mode=%s\n", app::displayModeName(mode));
-    return;
-  }
-
-  Serial.println("Unknown command. Type HELP.");
 }
 
 void pollSerial() {
@@ -217,165 +455,184 @@ void pollSerial() {
       if (serialLength > 0) {
         serialLine[serialLength] = '\0';
         handleSerialCommand(serialLine);
-        memset(serialLine, 0, sizeof(serialLine));
+        net::secureZero(serialLine, sizeof(serialLine));  // may hold a key
         serialLength = 0;
       }
       continue;
     }
-    if (value >= 32 && value <= 126 &&
-        serialLength < sizeof(serialLine) - 1) {
+    if (value >= 32 && value <= 126 && serialLength < sizeof(serialLine) - 1) {
       serialLine[serialLength++] = value;
     }
   }
 }
 
-void handleButtonEvent(const board::ButtonEvent& event) {
-  Serial.printf("[button] %s %s\n", board::buttonName(event.button),
-                board::buttonGestureName(event.gesture));
-  const app::UiModel model = runtimeState.snapshot();
-
-  if (event.gesture == board::ButtonGesture::LongPress) {
-    switch (event.button) {
-      case board::ButtonId::Upper:
-        agentClient.requestImmediatePoll();
-        break;
-      case board::ButtonId::Middle:
-        if (runtimeState.setPage(1)) runtimeState.requestRefresh();
-        break;
-      case board::ButtonId::Lower:
-        if (runtimeState.setPage(0)) runtimeState.requestRefresh();
-        break;
-    }
-    return;
-  }
-
-  switch (event.button) {
+void handleButton(board::ButtonId button, board::ButtonGesture gesture) {
+  lastActivityMs = millis();
+  Serial.printf("[button] %s %s\n", board::buttonName(button),
+                board::buttonGestureName(gesture));
+  const bool longPress = gesture == board::ButtonGesture::LongPress;
+  switch (button) {
     case board::ButtonId::Upper:
-      if (runtimeState.setPage(static_cast<uint8_t>((model.page + 1) % 2))) {
-        runtimeState.requestRefresh();
+      if (longPress) {
+        interactiveFetch();
+      } else {
+        setPage(page == app::Page::Home ? app::Page::System : app::Page::Home);
       }
       break;
     case board::ButtonId::Middle:
-      runtimeState.requestRefresh();
-      break;
-    case board::ButtonId::Lower:
-      if (model.page > 0 && runtimeState.setPage(model.page - 1)) {
-        runtimeState.requestRefresh();
+      if (longPress) {
+        setPage(app::Page::System);
+      } else {
+        interactiveFetch();
       }
       break;
+    case board::ButtonId::Lower:
+      setPage(app::Page::Home);
+      break;
   }
 }
 
-void pollButtons() {
-  board::Buttons& buttons = deviceBoard.buttons();
-  buttons.update(millis());
-  board::ButtonEvent event;
-  while (buttons.nextEvent(event)) handleButtonEvent(event);
+// The button that woke us is consumed here (released or held long).
+void handleWakeButton(board::ButtonId button, uint8_t pin) {
+  const uint32_t start = millis();
+  while (digitalRead(pin) == LOW && millis() - start < 3000) delay(10);
+  const bool longPress = millis() - start >= board::kButtonLongPressMs;
+  handleButton(button, longPress ? board::ButtonGesture::LongPress
+                                 : board::ButtonGesture::ShortPress);
 }
 
-void ensureDeviceServer(uint32_t nowMs) {
-  if (connectivity.portalActive()) {
-    if (serverStarted) {
-      deviceServer.end();
-      serverStarted = false;
-      Serial.println("[http] stopped while provisioning portal owns port 80");
-    }
-    return;
+// ---------------------------------------------------------------------------
+[[noreturn]] void runTimerWake() {
+  const int64_t now = nowEpoch();
+  if (clockSynced() && rtc.planEpoch - now > app::kEarlyWakeToleranceSeconds) {
+    Serial.println("[power] early wake (RTC drift); sleeping again");
+    sleepUntilPlan();
   }
-  if (serverStarted || !connectivity.snapshot().connected) {
-    return;
+  const app::WakeKind kind = static_cast<app::WakeKind>(rtc.planKind);
+  Serial.printf("[wake] timer: %s\n",
+                kind == app::WakeKind::AlertCheck ? "alert check" : "full update");
+  bool ok = false;
+  if (!batteryLow()) {
+    ok = runFetch(kind == app::WakeKind::AlertCheck
+                      ? FetchMode::AlertsThenFullIfChanged
+                      : FetchMode::Full);
   }
-  if (lastServerAttemptAtMs != 0 &&
-      nowMs - lastServerAttemptAtMs < 5000) {
-    return;
-  }
-  lastServerAttemptAtMs = nowMs;
-  serverStarted = deviceServer.begin();
-  Serial.printf("[http] device API %s\n",
-                serverStarted ? "started on port 80" : "start failed");
-}
-
-void serviceDisplay(uint32_t nowMs) {
-  if (runtimeState.consumeRefreshRequest()) refreshPolicy.force(nowMs);
-
-  const app::UiModel observed = runtimeState.snapshot();
-  refreshPolicy.observe(observed, nowMs);
-  if (refreshPolicy.lastRefreshAtMs() == 0 && nowMs < kInitialDisplayGraceMs) {
-    return;
-  }
-  if (!refreshPolicy.due(nowMs) || connectivity.portalActive() ||
-      epd.isFaultLocked()) {
-    return;
-  }
-
-  Serial.printf("[display] full revision %lu page %u starting\n",
-                static_cast<unsigned long>(observed.revision), observed.page);
-  const bool ok = epd.refresh(observed);
-  const uint32_t finishedAtMs = millis();
-  if (ok) {
-    runtimeState.markDisplayed(finishedAtMs);
-    refreshPolicy.markCompleted(observed, finishedAtMs);
-    Serial.printf("[display] completed in %lu ms\n",
-                  static_cast<unsigned long>(finishedAtMs - nowMs));
-  } else {
-    Serial.printf("[display] failed: %s (journal=%s)\n",
-                  ui::epdErrorName(epd.lastError()),
-                  ui::panelJournalStateName(epd.journalState()));
-    if (epd.isFaultLocked()) {
-      // A fault-locked panel must never be placed in an automatic retry loop.
-      refreshPolicy.markAbandoned(finishedAtMs);
-    }
-  }
+  page = app::Page::Home;
+  scheduleNext(!ok);
+  updateDisplay(false);
+  sleepUntilPlan();
 }
 
 }  // namespace
 
 void setup() {
+  gpio_hold_dis(static_cast<gpio_num_t>(board::kPeripheralEnable));
+  gpio_deep_sleep_hold_dis();
+  // ext0/ext1 wake leaves the button pins routed to the RTC domain; return
+  // them to the digital GPIO matrix before Board configures them as inputs.
+  rtc_gpio_deinit(static_cast<gpio_num_t>(board::kButtonUpper));
+  rtc_gpio_deinit(static_cast<gpio_num_t>(board::kButtonMiddle));
   deviceBoard.begin();
   Serial.begin(board::kSerialBaud);
-  delay(350);
+  delay(50);
+
+  const esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+  const bool fromSleep = cause == ESP_SLEEP_WAKEUP_TIMER ||
+                         cause == ESP_SLEEP_WAKEUP_EXT0 ||
+                         cause == ESP_SLEEP_WAKEUP_EXT1;
+  if (!fromSleep || rtc.magic != kRtcMagic) {
+    memset(rtcStorage, 0, sizeof(rtcStorage));
+    new (rtcStorage) RtcState();
+    rtc.magic = kRtcMagic;
+  }
+  ++rtc.wakeCount;
+  setenv("TZ", board::kTimeZone, 1);
+  tzset();
 
   Serial.println();
-  Serial.println("Epaper75 P1 starting");
-  Serial.printf("chip=%s rev=%d cores=%d flash=%lu psram=%lu reset=%d\n",
-                ESP.getChipModel(), ESP.getChipRevision(), ESP.getChipCores(),
-                static_cast<unsigned long>(ESP.getFlashChipSize()),
-                static_cast<unsigned long>(ESP.getPsramSize()),
+  Serial.printf("Epaper75 %s wake=%lu cause=%d reset=%d\n", board::kFirmwareVersion,
+                static_cast<unsigned long>(rtc.wakeCount), static_cast<int>(cause),
                 static_cast<int>(esp_reset_reason()));
 
-  net::StoredSettings stored;
-  settingsStore.load(stored);
-  runtimeState.setDisplayMode(stored.mode);
-  if (!stored.agents.ready()) runtimeState.setPage(1);
+  settingsStore.loadWeather(weatherSettings);
+  if (!rtc.place.valid && weatherSettings.hasLocation) {
+    net::PlaceCache cache;
+    if (settingsStore.loadPlace(cache) &&
+        cache.latitudeCenti == weatherSettings.latitudeCenti &&
+        cache.longitudeCenti == weatherSettings.longitudeCenti) {
+      rtc.place = cache.place;
+    }
+  }
+  sampleTelemetry();
 
-  publishTelemetry();
-  connectivity.begin();
-  runtimeState.updateNetwork(connectivity.snapshot());
-  lastAgentTaskAttemptAtMs = millis();
-  Serial.printf("[agents] polling task %s\n",
-                agentClient.begin() ? "started on core 0" : "start failed");
+  if (cause == ESP_SLEEP_WAKEUP_TIMER) runTimerWake();
+
+  interactive = true;
+  lastActivityMs = millis();
+  page = app::Page::Home;
+  deviceBoard.buttons().begin();
   printHelp();
+
+  if (cause == ESP_SLEEP_WAKEUP_EXT0) {
+    handleWakeButton(board::ButtonId::Middle, board::kButtonMiddle);
+  } else if (cause == ESP_SLEEP_WAKEUP_EXT1) {
+    handleWakeButton(board::ButtonId::Upper, board::kButtonUpper);
+  } else {
+    // Cold boot: fetch immediately (or offer Wi-Fi setup) and redraw.
+    if (!connectivity.hasStoredCredentials()) {
+      Serial.println("[wifi] no stored network; starting Epaper75-Setup portal");
+      connectivity.startPortal();
+      scheduleNext(false);
+      requestRefresh(true);
+    } else {
+      interactiveFetch();
+    }
+  }
+  deviceBoard.buttons().clearEvents();
   printInfo();
 }
 
 void loop() {
-  const uint32_t nowMs = millis();
-
   pollSerial();
-  pollButtons();
-  connectivity.loop();
-  runtimeState.updateNetwork(connectivity.snapshot());
-  ensureDeviceServer(nowMs);
-  if (!agentClient.running() &&
-      nowMs - lastAgentTaskAttemptAtMs >= 10000U) {
-    lastAgentTaskAttemptAtMs = nowMs;
-    Serial.printf("[agents] polling task retry %s\n",
-                  agentClient.begin() ? "accepted" : "failed");
-  }
-  if (nowMs - lastSensorSampleAtMs >= board::kSensorPeriodMs) {
-    publishTelemetry();
+
+  board::Buttons& buttons = deviceBoard.buttons();
+  buttons.update(millis());
+  board::ButtonEvent event;
+  while (buttons.nextEvent(event)) handleButton(event.button, event.gesture);
+
+  if (connectivity.portalActive()) {
+    connectivity.loopPortal();
+    lastActivityMs = millis();  // stay awake while the portal is open
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.println("[wifi] provisioned");
+      connectivity.stopPortal();
+      interactiveFetch();
+    }
   }
 
-  serviceDisplay(nowMs);
-  delay(2);
+  if (refreshPending && millis() - lastRefreshEndMs >= board::kMinRefreshGapMs) {
+    refreshPending = false;
+    const bool force = forceRefresh;
+    forceRefresh = false;
+    if (!connectivity.portalActive()) {
+      updateDisplay(force);
+    } else {
+      // Show setup instructions without leaving the portal.
+      updateDisplay(true);
+    }
+    lastActivityMs = millis();
+  }
+
+  if (!connectivity.portalActive() && !refreshPending &&
+      millis() - lastActivityMs >= board::kInteractiveWindowMs) {
+    if (page != app::Page::Home) {
+      page = app::Page::Home;
+      updateDisplay(false);
+    }
+    if (rtc.planEpoch == 0 || (clockSynced() && rtc.planEpoch <= nowEpoch())) {
+      scheduleNext(false);
+    }
+    sleepUntilPlan();
+  }
+  delay(5);
 }

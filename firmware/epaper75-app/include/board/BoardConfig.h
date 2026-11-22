@@ -4,7 +4,7 @@
 
 namespace board {
 
-constexpr char kFirmwareVersion[] = "0.5.1-p1";
+constexpr char kFirmwareVersion[] = "0.6.0-p1";
 constexpr uint32_t kSerialBaud = 115200;
 
 // 7.5-inch 800x480 black/white/red panel.  The flex is marked
@@ -42,17 +42,19 @@ constexpr uint8_t kButtonPressedLevel = LOW;
 
 constexpr uint32_t kButtonDebounceMs = 30;
 constexpr uint32_t kButtonLongPressMs = 900;
-constexpr uint32_t kSensorPeriodMs = 60000;
-// One Agent slot is polled per interval, so three configured machines are
-// each refreshed about once every 15 seconds without parallel HTTP pressure.
-constexpr uint32_t kAgentPollSlotPeriodMs = 5000;
-constexpr uint32_t kRoutineRefreshFloorMs = 5UL * 60UL * 1000UL;
-constexpr uint32_t kUrgentRefreshFloorMs = 60000;
-constexpr uint32_t kForcedRefreshFloorMs = 30000;
-constexpr uint32_t kUiCoalesceMs = 1500;
+// Power strategy (0.6.x): deep sleep between scheduled wakes. See
+// app/Schedule.h for the wake table and docs/POWER.md for the rationale.
+constexpr uint32_t kInteractiveWindowMs = 90000;   // awake after button/boot
+constexpr uint32_t kPortalTimeoutMs = 10UL * 60UL * 1000UL;
+constexpr uint32_t kWifiConnectTimeoutMs = 15000;
+constexpr uint32_t kClockSyncTimeoutMs = 10000;
+constexpr uint32_t kMinRefreshGapMs = 10000;       // between two panel refreshes
+// Below this the radio stays off and only the low-battery mark is drawn.
+// Readings under kBatteryAbsentMv mean "no battery / USB only".
+constexpr uint16_t kBatteryCutoffMv = 3450;
+constexpr uint16_t kBatteryAbsentMv = 2500;
+constexpr char kTimeZone[] = "CST-8";
 
-constexpr uint16_t kDeviceHttpPort = 80;
-constexpr uint16_t kDefaultBridgePort = 8765;
 constexpr char kProvisioningApName[] = "Epaper75-Setup";
 
 }  // namespace board

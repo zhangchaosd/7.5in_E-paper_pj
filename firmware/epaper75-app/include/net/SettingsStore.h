@@ -1,86 +1,60 @@
 #pragma once
 
 #include <Arduino.h>
-#include <freertos/FreeRTOS.h>
-#include <freertos/semphr.h>
 
 #include "app/Models.h"
 
 namespace net {
 
-constexpr uint16_t kDefaultAgentPort = 8765;
-constexpr size_t kAgentTokenSize = 96;
-constexpr size_t kAgentInstallationIdSize = 48;
+constexpr size_t kApiHostSize = 64;
+constexpr size_t kQWeatherIdSize = 24;
+constexpr size_t kEd25519SeedSize = 32;
 
-// Connection details deliberately live outside UiModel so credentials and
-// LAN addresses cannot leak through renderer snapshots or the device API.
-struct AgentEndpoint {
-  char host[app::kHostTextSize] = {};
-  uint16_t port = kDefaultAgentPort;
+// QWeather JWT credentials and the forecast location. These never enter
+// UiModel, serial output, or the renderer. Coordinates are stored as
+// hundredths of a degree (QWeather accepts at most two decimals).
+struct WeatherSettings {
+  char apiHost[kApiHostSize] = {};          // e.g. abcxyz.qweatherapi.com
+  char developerId[kQWeatherIdSize] = {};   // JWT iss
+  char projectId[kQWeatherIdSize] = {};     // JWT sub
+  char credentialId[kQWeatherIdSize] = {};  // JWT kid
+  uint8_t seed[kEd25519SeedSize] = {};      // Ed25519 private key seed
+  bool hasCredentials = false;
+  int16_t latitudeCenti = 0;   // -9000..9000
+  int16_t longitudeCenti = 0;  // -18000..18000
+  bool hasLocation = false;
 
-  bool configured() const { return host[0] != '\0'; }
+  bool ready() const { return hasCredentials && hasLocation; }
 };
 
-struct AgentFleetSettings {
-  AgentEndpoint endpoints[app::kAgentDeviceCount];
-  // Learned during the first authenticated pairing and then pinned across
-  // reboots. Empty means the USB-provisioned endpoint is not paired yet.
-  char installationIds[app::kAgentDeviceCount][kAgentInstallationIdSize] = {};
-  char token[kAgentTokenSize] = {};
-  uint8_t primaryIndex = 0;
-
-  size_t configuredCount() const;
-  bool hasToken() const;
-  bool ready() const;
+// Cached GeoAPI result, keyed by the coordinates it was resolved for.
+struct PlaceCache {
+  app::PlaceSnapshot place;
+  int16_t latitudeCenti = 0;
+  int16_t longitudeCenti = 0;
 };
 
-struct StoredSettings {
-  AgentFleetSettings agents;
-  app::DisplayMode mode = app::DisplayMode::Auto;
-};
+bool validateApiHost(const char* host);
+bool validateQWeatherId(const char* id);
+// Accepts the base64 body of a PKCS#8 Ed25519 PEM (48 bytes decoded) or a
+// raw base64 32-byte seed. Writes the seed only when the whole input is valid.
+bool parseEd25519PrivateKey(const char* base64, uint8_t (&seed)[kEd25519SeedSize]);
+// Parses "39.92" style decimal degrees into hundredths, rounding half away.
+bool parseCoordinate(const char* text, int16_t limitCenti, int16_t& output);
 
-enum class PinInstallationIdResult : uint8_t {
-  Pinned = 0,
-  AlreadyPinned,
-  Superseded,
-  Invalid,
-  StorageError,
-};
+void secureZero(void* memory, size_t size);
 
-// Accepts an IPv4 address or DNS/mDNS name, optionally followed by :port.
-// The output is only changed when the entire input is valid.
-bool parseAgentEndpoint(const char* text, AgentEndpoint& output);
-
-// Bearer tokens are kept to one non-empty visible-ASCII header value. The
-// fixed buffer includes its trailing NUL.
-bool validateAgentToken(const char* token);
-
-// Uses an application-owned NVS namespace and never resets the ESP32 Wi-Fi
-// namespace. Each operation opens Preferences only for its own short lifetime.
-// The mutex serializes callers on the Arduino and HTTP tasks.
+// Uses the application-owned NVS namespace only. Never touches the Wi-Fi
+// driver's namespace. All calls happen on the Arduino loop task.
 class SettingsStore {
  public:
-  SettingsStore();
-  ~SettingsStore();
+  bool loadWeather(WeatherSettings& output);
+  bool saveCredentials(const WeatherSettings& credentials);
+  bool saveLocation(int16_t latitudeCenti, int16_t longitudeCenti);
+  bool clearWeather();
 
-  SettingsStore(const SettingsStore&) = delete;
-  SettingsStore& operator=(const SettingsStore&) = delete;
-
-  bool load(StoredSettings& output);
-  bool saveAgents(const AgentFleetSettings& agents);
-  // Atomically pins one identity only if the current endpoint/token/primary
-  // configuration still matches expected. This prevents a completed poll from
-  // overwriting a newer USB provisioning command.
-  PinInstallationIdResult pinInstallationId(
-      size_t slotIndex, const AgentFleetSettings& expected,
-      const char* installationId, AgentFleetSettings& updated);
-  bool saveDisplayMode(app::DisplayMode mode);
-
- private:
-  bool take();
-  void give();
-
-  SemaphoreHandle_t mutex_ = nullptr;
+  bool loadPlace(PlaceCache& output);
+  bool savePlace(const PlaceCache& place);
 };
 
 }  // namespace net
